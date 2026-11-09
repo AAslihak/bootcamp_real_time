@@ -14,14 +14,14 @@ import matplotlib.pyplot as plt
 
 
 DEVICE = "Dev1"
-AO_CHAN = "ao0"
+AO_CHAN = "ao1"
 AI_CHANNELS = ["ai0", "ai1", "ai2", "ai3"]
-FS = 100_000           # samples/sec
-FREQ_HZ = 1_000        # output sine frequency
+FS = 100000           # samples/sec
+FREQ_HZ = 1000        # output sine frequency
 N_CYCLES = 10          # number of full sine cycles
 DURATION_SEC = N_CYCLES / FREQ_HZ
-AI_RANGE = 5.0         # input range in volts (+/-)
-AO_AMPLITUDE = 0.5     # output amplitude in volts peak
+AI_RANGE = 2.0         # input range in volts (+/-)
+AO_AMPLITUDE = 1.0     # output amplitude in volts peak
 
 
 def make_output_wave(fs, freq_hz, n_cycles, amplitude):
