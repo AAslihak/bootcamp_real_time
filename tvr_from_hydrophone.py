@@ -37,7 +37,7 @@ HYD_GAIN_DB   = 0.0              # preamp gain after the hydrophone (dB)
 DRIVE_RATIO   = 1.0              # V_source / V_measured (e.g. 10 for a 10:1 probe or divider)
 
 # water properties for the absorption (Francois-Garrison)
-TEMP_C        = 25.0             # temperature (C)
+TEMP_C        = 20.0             # temperature (C)
 SALINITY      = 0.0              # practical salinity: 0 = fresh tank, 35 = seawater
 DEPTH_M       = 1.0              # depth (m)
 PH            = 8.0              # pH (only matters in seawater)
