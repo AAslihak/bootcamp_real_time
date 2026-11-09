@@ -20,14 +20,14 @@ from scipy.signal import chirp, correlate, spectrogram, hilbert, find_peaks
 from scipy.signal.windows import tukey
 
 # ======================= SETUP: EDIT THESE ===========================
-SIMULATE  = True          # True: synthetic data, no hardware needed
+SIMULATE  = False          # True: synthetic data, no hardware needed
 
 DEVICE    = "Dev1"        # name shown in NI MAX
 AO_CHAN   = "ao0"         # output (to amplifier, or looped back to ai0)
 AI_CHAN   = "ai0"         # input (hydrophone, or the loopback cable)
 FS        = 2_000_000     # sample rate (S/s). USB-6366 AI max is 2 MS/s per channel
 
-F0, F1    = 10_000, 100_000   # chirp start and end frequency (Hz)
+F0, F1    = 8_000, 12_000   # chirp start and end frequency (Hz)
 T_CHIRP   = 2e-3              # chirp length (s)
 AMPL      = 0.5               # output amplitude (V peak). AO range is +-10 V
 T_LISTEN  = 10e-3             # how long to keep recording after the chirp ends (s)
