@@ -9,6 +9,7 @@ Features:
 - start/stop transmit
 - live waveform, time-averaged PSD, and spectrogram previews
 - playback through the default computer audio output without a DAQ
+- optional Golay complementary coding of complete probe cycles
 """
 
 import threading
@@ -56,6 +57,10 @@ class ChirpTransmitApp:
         self.fs_var = tk.StringVar(value="44000")
         self.amplitude_var = tk.StringVar(value="0.5")
         self.repeats_var = tk.StringVar(value="1")
+        self.golay_enabled_var = tk.BooleanVar(value=False)
+        self.golay_order_var = tk.StringVar(value="3")
+        self.golay_gap_var = tk.StringVar(value="0")
+        self.golay_info_var = tk.StringVar()
         self.save_wav_var = tk.BooleanVar(value=False)
         self.wav_path_var = tk.StringVar(value="chirp.wav")
         self.status_var = tk.StringVar(value="Idle")
@@ -65,7 +70,9 @@ class ChirpTransmitApp:
         self._build_ui()
         self._on_device_change()
         self._on_signal_change()
-        for variable in (self.f0_var, self.f1_var, self.t_cycle_var, self.duty_cycle_var, self.order_var, self.fs_var, self.amplitude_var, self.repeats_var):
+        self._on_golay_change()
+        self.golay_enabled_var.trace_add("write", self._on_golay_change)
+        for variable in (self.f0_var, self.f1_var, self.t_cycle_var, self.duty_cycle_var, self.order_var, self.fs_var, self.amplitude_var, self.repeats_var, self.golay_order_var, self.golay_gap_var):
             variable.trace_add("write", self._schedule_preview)
         self._update_preview()
 
@@ -148,28 +155,45 @@ class ChirpTransmitApp:
         ttk.Entry(parameters, textvariable=self.t_cycle_var).grid(row=3, column=1, sticky="ew", padx=5, pady=4)
         ttk.Label(parameters, text="Duty-cycle %:").grid(row=4, column=0, sticky="w", padx=5, pady=4)
         ttk.Spinbox(parameters, from_=0, to=100, increment=1, textvariable=self.duty_cycle_var).grid(row=4, column=1, sticky="ew", padx=5, pady=4)
-        ttk.Label(parameters, text="FS (Hz):").grid(row=5, column=0, sticky="w", padx=5, pady=4)
-        ttk.Entry(parameters, textvariable=self.fs_var).grid(row=5, column=1, sticky="ew", padx=5, pady=4)
-        self.amplitude_label = ttk.Label(parameters, text="Amplitude (V peak):")
-        self.amplitude_label.grid(row=6, column=0, sticky="w", padx=5, pady=4)
-        ttk.Entry(parameters, textvariable=self.amplitude_var).grid(row=6, column=1, sticky="ew", padx=5, pady=4)
-        ttk.Label(parameters, text="Repeats:").grid(row=7, column=0, sticky="w", padx=5, pady=4)
-        ttk.Entry(parameters, textvariable=self.repeats_var).grid(row=7, column=1, sticky="ew", padx=5, pady=4)
+        shared = ttk.Frame(parameters)
+        shared.grid(row=5, column=0, columnspan=2, sticky="ew")
+        for column in (1, 3, 5):
+            shared.columnconfigure(column, weight=1)
+        ttk.Label(shared, text="FS (Hz):").grid(row=0, column=0, sticky="w", padx=5, pady=4)
+        ttk.Entry(shared, textvariable=self.fs_var, width=12).grid(row=0, column=1, sticky="ew", padx=5, pady=4)
+        self.amplitude_label = ttk.Label(shared, text="Amplitude (V peak):")
+        self.amplitude_label.grid(row=0, column=2, sticky="w", padx=5, pady=4)
+        ttk.Entry(shared, textvariable=self.amplitude_var, width=12).grid(row=0, column=3, sticky="ew", padx=5, pady=4)
+        self.repeats_label = ttk.Label(shared, text="Repeats:")
+        self.repeats_label.grid(row=0, column=4, sticky="w", padx=5, pady=4)
+        ttk.Entry(shared, textvariable=self.repeats_var, width=8).grid(row=0, column=5, sticky="ew", padx=5, pady=4)
+
+        golay = ttk.LabelFrame(main, text="Golay pairs", padding=5)
+        golay.grid(row=5, column=0, columnspan=3, sticky="ew", padx=5, pady=4)
+        golay.columnconfigure(4, weight=1)
+        ttk.Checkbutton(golay, text="Enable Golay pairs", variable=self.golay_enabled_var).grid(row=0, column=0, sticky="w", padx=5, pady=4)
+        ttk.Label(golay, text="Golay order:").grid(row=0, column=1, sticky="w", padx=5, pady=4)
+        self.golay_order_entry = ttk.Spinbox(golay, from_=1, to=12, textvariable=self.golay_order_var, width=6)
+        self.golay_order_entry.grid(row=0, column=2, sticky="w", padx=5, pady=4)
+        ttk.Label(golay, text="Inter-code gap (s):").grid(row=0, column=3, sticky="w", padx=5, pady=4)
+        self.golay_gap_entry = ttk.Entry(golay, textvariable=self.golay_gap_var, width=12)
+        self.golay_gap_entry.grid(row=0, column=4, sticky="ew", padx=5, pady=4)
+        ttk.Label(golay, textvariable=self.golay_info_var, wraplength=1000).grid(row=1, column=0, columnspan=5, sticky="w", padx=5, pady=2)
 
         output = ttk.Frame(main)
-        output.grid(row=5, column=0, columnspan=3, sticky="ew")
+        output.grid(row=6, column=0, columnspan=3, sticky="ew")
         output.columnconfigure(1, weight=1)
         ttk.Checkbutton(output, text="Save generated signal to WAV", variable=self.save_wav_var).grid(row=0, column=0, columnspan=3, sticky="w", padx=5, pady=4)
         ttk.Label(output, text="WAV file:").grid(row=1, column=0, sticky="w", padx=5, pady=4)
         ttk.Entry(output, textvariable=self.wav_path_var).grid(row=1, column=1, sticky="ew", padx=5, pady=4)
         ttk.Button(output, text="Browse...", command=self._browse_wav_path).grid(row=1, column=2, padx=5, pady=4)
         button_row = ttk.Frame(main)
-        button_row.grid(row=6, column=0, columnspan=3, pady=6, sticky="ew")
+        button_row.grid(row=7, column=0, columnspan=3, pady=6, sticky="ew")
         button_row.columnconfigure(0, weight=1)
         button_row.columnconfigure(1, weight=1)
         ttk.Button(button_row, text="Start", command=self.start_output).grid(row=0, column=0, padx=5, sticky="ew")
         ttk.Button(button_row, text="Stop", command=self.stop_output).grid(row=0, column=1, padx=5, sticky="ew")
-        ttk.Label(main, textvariable=self.status_var, foreground="darkblue", wraplength=1000).grid(row=7, column=0, columnspan=3, sticky="w", padx=5, pady=4)
+        ttk.Label(main, textvariable=self.status_var, foreground="darkblue", wraplength=1000).grid(row=8, column=0, columnspan=3, sticky="w", padx=5, pady=4)
 
     def _on_signal_change(self, event=None):
         signal_type = self.signal_type_var.get()
@@ -193,6 +217,13 @@ class ChirpTransmitApp:
             self.root.after_cancel(self.preview_after_id)
         self.preview_after_id = self.root.after(250, self._update_preview)
 
+    def _on_golay_change(self, *args):
+        enabled = self.golay_enabled_var.get()
+        self.golay_order_entry.config(state="normal" if enabled else "disabled")
+        self.golay_gap_entry.config(state="normal" if enabled else "disabled")
+        self.repeats_label.config(text="Repeats (A/B pairs):" if enabled else "Repeats:")
+        self._schedule_preview()
+
     def _show_help(self):
         if self.help_window is not None and self.help_window.winfo_exists():
             self.help_window.lift()
@@ -211,7 +242,12 @@ class ChirpTransmitApp:
             "Duty-cycle %: active fraction at the start of every cycle; the remainder is zero. 0% gives silence; 100% has no appended silent interval. Active samples = floor(cycle samples × duty-cycle / 100).\n\n"
             "FS (Hz): samples per second. Frequencies must be below FS / 2. Speaker playback is resampled to the audio device's rate, preserving duration and pitch within the device's bandwidth.\n\n"
             "Amplitude: peak volts for DAQ output (0–10), or digital full-scale amplitude for speakers (0–1). Speaker volume also depends on macOS volume; this is not calibrated acoustic pressure. No automatic normalization is applied.\n\n"
-            "Repeats: positive integer number of identical cycles. Total intended duration is cycle samples × repeats / FS. Every cycle restarts the waveform and code phase.\n\n"
+            "Repeats: positive integer number of identical cycles when Golay pairs are off, or complete A/B pairs when on. Every underlying cycle restarts the waveform and internal M-sequence phase.\n\n"
+            "Enable Golay pairs: uses each complete probe-plus-silence cycle as one Golay chip. Each +1 chip plays the cycle unchanged; each −1 chip reverses its sign (180° phase shift). Output order is A-coded cycles → gap → B-coded cycles → gap, repeated as complete pairs. Tone, Chirp, and M sequences all support this outer coding. The per-cycle edge taper is retained; no extra whole-code taper is applied.\n\n"
+            "Golay order: integer from 1 to 12; each member contains 2^order chips. Order 3 therefore uses eight cycles for A and eight for B. This does not change the internal M-sequence order.\n\n"
+            "Inter-code gap (s): additional silence after BOTH A and B, beyond the silence already in every chip. Gap sample count is floor(FS × gap).\n\n"
+            "Total playback duration: without Golay, cycle samples × repeats / FS. With Golay, 2 × (2^order × cycle samples + gap samples) × repeats / FS. For T_cycle = 0.100 s, Golay order 3, gap = 0, and Repeats = 1, playback lasts 1.6 s. Higher orders increase duration and in-memory playback buffers exponentially. The displayed duration uses actual sample counts and remains available when a sequence exceeds the preview limit.\n\n"
+            "Golay decoding: separately matched-filter the received A and B members with their corresponding transmitted templates, align the responses, and sum them. Complementary coding cancels code sidelobes for an unchanged linear channel, leaving the underlying chip-waveform response. Finite waveform bandwidth, motion, channel changes, and nonlinear distortion limit the result. This GUI only transmits; it does not acquire or decode the returns. The saved WAV contains A, gap, B, gap, and any requested repeated pairs.\n\n"
             "Save generated signal to WAV: saves the entire repeated digital sequence, including silence, at FS before speaker resampling. Choose its path with Browse.\n\n"
             "Start / Stop: starts or interrupts playback. Playback uses the parameter values captured when Start was clicked; edits update the next playback and the previews.\n\n"
             "Previews, left to right: waveform (amplitude versus time, including repeats and silence); time-averaged PSD; spectrogram (frequency versus time). The PSD averages the spectrogram's linear power densities, including silence, before conversion to dB. Segment detrending is disabled: subtracting an unweighted segment mean before Hann windowing can create a spurious near-DC feature. Finite probe duration, gating, and phase coding still produce real spectral spread outside nominal frequencies. These plots describe the intended electrical/digital waveform, not the transducer or speaker response. Preview limit: 2,000,000 samples.\n\n"
@@ -233,7 +269,7 @@ class ChirpTransmitApp:
             text.bold_font = tkfont.nametofont("TkDefaultFont").copy()
             text.bold_font.configure(weight="bold")
             text.tag_configure("parameter", font=text.bold_font)
-            for match in re.finditer(r"^(?:Fundamental frequency \(Hz\)|Start frequency \(Hz\)|Stop frequency \(Hz\)|Carrier frequency \(Hz\)|Sequence order|Device|AO channel|Signal type|T_cycle \(s\)|Duty-cycle %|FS \(Hz\)|Amplitude|Repeats|Save generated signal to WAV|Start / Stop|Previews, left to right|Edge taper):", text.get("1.0", "end-1c"), re.MULTILINE):
+            for match in re.finditer(r"^(?:Fundamental frequency \(Hz\)|Start frequency \(Hz\)|Stop frequency \(Hz\)|Carrier frequency \(Hz\)|Sequence order|Device|AO channel|Signal type|T_cycle \(s\)|Duty-cycle %|FS \(Hz\)|Amplitude|Repeats|Enable Golay pairs|Golay order|Inter-code gap \(s\)|Total playback duration|Golay decoding|Save generated signal to WAV|Start / Stop|Previews, left to right|Edge taper):", text.get("1.0", "end-1c"), re.MULTILINE):
                 text.tag_add("parameter", f"1.0+{match.start()}c", f"1.0+{match.end() - 1}c")
             text.config(state="disabled")
             if signal_type == self.signal_type_var.get():
@@ -241,6 +277,7 @@ class ChirpTransmitApp:
 
     def _update_preview(self):
         self.preview_after_id = None
+        self.golay_info_var.set("")
         if self.preview_colorbar is not None:
             self.preview_colorbar.remove()
             self.preview_colorbar = None
@@ -262,22 +299,32 @@ class ChirpTransmitApp:
 
         try:
             signal_type, f0, f1, t_cycle, duty_cycle, fs, amplitude, repeats, order = self._read_parameters()
+            golay_enabled, golay_order, gap_samples = self._read_golay_parameters(fs)
             n_cycle = int(t_cycle * fs)
             n_active = int(n_cycle * duty_cycle / 100)
+            if golay_enabled:
+                member_samples = (2**golay_order) * n_cycle
+                total_samples = 2 * (member_samples + gap_samples) * repeats
+                self.golay_info_var.set(f"{2**golay_order} chips/member | A → gap → B → gap | Total playback duration: {total_samples / fs:.6g} s ({repeats} pair(s))")
+            else:
+                total_samples = n_cycle * repeats
+                self.golay_info_var.set(f"Total playback duration: {total_samples / fs:.6g} s ({repeats} cycle(s))")
             if signal_type == "M sequences":
                 n_chips = 2**order - 1
                 chip_rate = n_chips * fs / n_active if n_active else 0
                 self.sequence_info_var.set(f"{n_chips} chips per active interval | Chip rate: {chip_rate:.2f} chips/s | Active: {n_active / fs:.6g} s")
-            if n_cycle * repeats > 2_000_000:
-                raise ValueError("Preview limited to 2,000,000 samples; reduce duration, FS, or repeats.")
+            if total_samples > 2_000_000:
+                raise ValueError("Preview limited to 2,000,000 samples; reduce duration, FS, repeats, or Golay order/gap.")
         except ValueError as exc:
             self.sequence_info_var.set(str(exc))
+            if not self.golay_info_var.get():
+                self.golay_info_var.set(str(exc))
             self.preview_axes.text(0.5, 0.5, str(exc), ha="center", va="center", wrap=True, transform=self.preview_axes.transAxes)
             self.preview_canvas.draw_idle()
             return
 
         cycle = self._make_signal(signal_type, f0, f1, t_cycle, duty_cycle, fs, amplitude, order)
-        data = np.tile(cycle, repeats)
+        data = self._make_output(cycle, repeats, golay_enabled, golay_order, gap_samples)
         sample_times = np.arange(len(data)) / fs
         self.waveform_axes.plot(sample_times, data, linewidth=0.7)
         self.waveform_axes.set_xlim(0, len(data) / fs)
@@ -388,6 +435,43 @@ class ChirpTransmitApp:
         cycle[:n_active] = probe
         return cycle
 
+    def _read_golay_parameters(self, fs):
+        enabled = self.golay_enabled_var.get()
+        if not enabled:
+            return False, 3, 0
+        order = int(self.golay_order_var.get())
+        gap = float(self.golay_gap_var.get())
+        if order < 1 or order > 12:
+            raise ValueError("Golay order must be an integer from 1 to 12.")
+        if not np.isfinite(gap) or gap < 0:
+            raise ValueError("Inter-code gap must be a finite, nonnegative number of seconds.")
+        gap_samples = int(fs * gap)
+        return enabled, order, gap_samples
+
+    def _make_golay_pair(self, order):
+        a = np.ones(1)
+        b = np.ones(1)
+        for level in range(order):
+            next_a = np.concatenate((a, b))
+            next_b = np.concatenate((a, -b))
+            a = next_a
+            b = next_b
+        return a, b
+
+    def _make_output(self, cycle, repeats, golay_enabled, golay_order, gap_samples):
+        if not golay_enabled:
+            return np.tile(cycle, repeats)
+        a, b = self._make_golay_pair(golay_order)
+        member_samples = len(a) * len(cycle)
+        pair = np.zeros(2 * (member_samples + gap_samples))
+        b_start = member_samples + gap_samples
+        for chip in range(len(a)):
+            start = chip * len(cycle)
+            stop = start + len(cycle)
+            pair[start:stop] = a[chip] * cycle
+            pair[b_start + start:b_start + stop] = b[chip] * cycle
+        return np.tile(pair, repeats)
+
     def _play_speaker(self, data, fs, stop_event):
         import sounddevice as sd
 
@@ -418,11 +502,11 @@ class ChirpTransmitApp:
         if error:
             messagebox.showerror("Transmit Error", error)
 
-    def _transmit_loop(self, device, channel, signal_type, f0, f1, t_cycle, duty_cycle, fs, amplitude, repeats, order, wav_path, stop_event):
+    def _transmit_loop(self, device, channel, signal_type, f0, f1, t_cycle, duty_cycle, fs, amplitude, repeats, order, golay_enabled, golay_order, gap_samples, wav_path, stop_event):
         error = None
         try:
             cycle = self._make_signal(signal_type, f0, f1, t_cycle, duty_cycle, fs, amplitude, order)
-            data = np.tile(cycle, repeats)
+            data = self._make_output(cycle, repeats, golay_enabled, golay_order, gap_samples)
             if wav_path:
                 from scipy.io import wavfile
                 wavfile.write(wav_path, int(round(fs)), np.asarray(data, dtype=np.float32))
@@ -459,6 +543,7 @@ class ChirpTransmitApp:
             device = self.device_var.get()
             channel = self._normalize_ao_channel(self.ao_channel_var.get())
             signal_type, f0, f1, t_cycle, duty_cycle, fs, amplitude, repeats, order = self._read_parameters()
+            golay_enabled, golay_order, gap_samples = self._read_golay_parameters(fs)
             if device != SPEAKER_DEVICE and self.ao_channel_var.get() not in self.available_channels:
                 raise ValueError("Select an available AO channel.")
             wav_path = None
@@ -475,7 +560,7 @@ class ChirpTransmitApp:
         self.running = True
         self.stop_event = threading.Event()
         self.status_var.set("Playing through default audio output (resampled to device rate if needed)..." if device == SPEAKER_DEVICE else "Running...")
-        self.thread = threading.Thread(target=self._transmit_loop, args=(device, channel, signal_type, f0, f1, t_cycle, duty_cycle, fs, amplitude, repeats, order, wav_path, self.stop_event), daemon=True)
+        self.thread = threading.Thread(target=self._transmit_loop, args=(device, channel, signal_type, f0, f1, t_cycle, duty_cycle, fs, amplitude, repeats, order, golay_enabled, golay_order, gap_samples, wav_path, self.stop_event), daemon=True)
         self.thread.start()
 
     def stop_output(self):
