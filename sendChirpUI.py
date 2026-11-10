@@ -9,7 +9,6 @@ Features:
 - start/stop transmit
 - live waveform, time-averaged PSD, spectrogram, and autocorrelation previews
 - playback through the default computer audio output without a DAQ
-- optional Golay complementary coding of complete probe cycles
 """
 
 import threading
@@ -59,14 +58,8 @@ class ChirpTransmitApp:
         self.fs_var = tk.StringVar(value="44000")
         self.amplitude_var = tk.StringVar(value="0.5")
         self.repeats_var = tk.StringVar(value="1")
-        self.golay_enabled_var = tk.BooleanVar(value=False)
-        self.golay_order_var = tk.StringVar(value="3")
-        self.golay_gap_var = tk.StringVar(value="0")
-        self.golay_info_var = tk.StringVar()
+        self.output_info_var = tk.StringVar()
         self.lag_half_width_var = tk.StringVar(value="5")
-        self.show_combined_var = tk.BooleanVar(value=True)
-        self.show_a_only_var = tk.BooleanVar(value=True)
-        self.show_one_cycle_var = tk.BooleanVar(value=True)
         self.save_wav_var = tk.BooleanVar(value=False)
         self.wav_path_var = tk.StringVar(value="chirp.wav")
         self.status_var = tk.StringVar(value="Idle")
@@ -76,12 +69,8 @@ class ChirpTransmitApp:
         self._build_ui()
         self._on_device_change()
         self._on_signal_change()
-        self._on_golay_change()
-        self.golay_enabled_var.trace_add("write", self._on_golay_change)
-        for variable in (self.f0_var, self.f1_var, self.t_cycle_var, self.duty_cycle_var, self.order_var, self.fs_var, self.amplitude_var, self.repeats_var, self.golay_order_var, self.golay_gap_var, self.lag_half_width_var):
+        for variable in (self.f0_var, self.f1_var, self.t_cycle_var, self.duty_cycle_var, self.order_var, self.fs_var, self.amplitude_var, self.repeats_var, self.lag_half_width_var):
             variable.trace_add("write", self._schedule_preview)
-        for variable in (self.show_combined_var, self.show_a_only_var, self.show_one_cycle_var):
-            variable.trace_add("write", self._update_autocorrelation_visibility)
         self._update_preview()
 
     def _discover_devices(self):
@@ -136,11 +125,6 @@ class ChirpTransmitApp:
         lag_controls.grid(row=2, column=2, sticky="e", padx=5, pady=4)
         ttk.Label(lag_controls, text="Lag half-width (ms):").pack(side="left", padx=5)
         ttk.Entry(lag_controls, textvariable=self.lag_half_width_var, width=7).pack(side="left")
-        self.autocorrelation_checkbuttons = []
-        for label, variable in (("A + B", self.show_combined_var), ("A only", self.show_a_only_var), ("One cycle", self.show_one_cycle_var)):
-            checkbutton = ttk.Checkbutton(lag_controls, text=label, variable=variable)
-            checkbutton.pack(side="left", padx=4)
-            self.autocorrelation_checkbuttons.append(checkbutton)
 
         self.preview_frame = ttk.LabelFrame(main, text="Intended signal — waveform, PSD, spectrogram, and autocorrelation", padding=5)
         self.preview_frame.grid(row=3, column=0, columnspan=3, sticky="nsew", padx=5, pady=8)
@@ -187,17 +171,7 @@ class ChirpTransmitApp:
         self.repeats_label.grid(row=0, column=4, sticky="w", padx=5, pady=4)
         ttk.Entry(shared, textvariable=self.repeats_var, width=8).grid(row=0, column=5, sticky="ew", padx=5, pady=4)
 
-        golay = ttk.LabelFrame(main, text="Golay pairs", padding=5)
-        golay.grid(row=5, column=0, columnspan=3, sticky="ew", padx=5, pady=4)
-        golay.columnconfigure(4, weight=1)
-        ttk.Checkbutton(golay, text="Enable Golay pairs", variable=self.golay_enabled_var).grid(row=0, column=0, sticky="w", padx=5, pady=4)
-        ttk.Label(golay, text="Golay order:").grid(row=0, column=1, sticky="w", padx=5, pady=4)
-        self.golay_order_entry = ttk.Spinbox(golay, from_=1, to=12, textvariable=self.golay_order_var, width=6)
-        self.golay_order_entry.grid(row=0, column=2, sticky="w", padx=5, pady=4)
-        ttk.Label(golay, text="Inter-code gap (s):").grid(row=0, column=3, sticky="w", padx=5, pady=4)
-        self.golay_gap_entry = ttk.Entry(golay, textvariable=self.golay_gap_var, width=12)
-        self.golay_gap_entry.grid(row=0, column=4, sticky="ew", padx=5, pady=4)
-        ttk.Label(golay, textvariable=self.golay_info_var, wraplength=1000).grid(row=1, column=0, columnspan=5, sticky="w", padx=5, pady=2)
+        ttk.Label(main, textvariable=self.output_info_var, wraplength=1300).grid(row=5, column=0, columnspan=3, sticky="w", padx=5, pady=4)
 
         output = ttk.Frame(main)
         output.grid(row=6, column=0, columnspan=3, sticky="ew")
@@ -236,16 +210,6 @@ class ChirpTransmitApp:
             self.root.after_cancel(self.preview_after_id)
         self.preview_after_id = self.root.after(250, self._update_preview)
 
-    def _on_golay_change(self, *args):
-        enabled = self.golay_enabled_var.get()
-        self.golay_order_entry.config(state="normal" if enabled else "disabled")
-        self.golay_gap_entry.config(state="normal" if enabled else "disabled")
-        view_enabled = self.active_output['golay_enabled'] if self.running else enabled
-        for checkbutton in self.autocorrelation_checkbuttons:
-            checkbutton.config(state="normal" if view_enabled else "disabled")
-        self.repeats_label.config(text="Repeats (A/B pairs):" if enabled else "Repeats:")
-        self._schedule_preview()
-
     def _show_help(self):
         if self.help_window is not None and self.help_window.winfo_exists():
             self.help_window.lift()
@@ -262,21 +226,15 @@ class ChirpTransmitApp:
             "Signal type: selects Tone, Chirp, or M sequences and shows only the relevant fields.\n\n"
             "T_cycle (s): length of one complete probe-plus-silence cycle. Repeats includes both portions. The cycle sample count is floor(FS × T_cycle).\n\n"
             "Duty-cycle %: active fraction at the start of every cycle; the remainder is zero. 0% gives silence; 100% has no appended silent interval. Active samples = floor(cycle samples × duty-cycle / 100).\n\n"
-            "FS (Hz): whole-number synthesis sample rate. Frequencies must be below FS / 2. For a DAQ, the prepared rate is FS. For speakers, one full cycle is resampled to the selected audio device's native rate BEFORE repeats/Golay assembly, plotting, saving, and playback. The cycle length rounds up to a whole output sample and the source gap duration rounds to the nearest output sample, so actual timing can differ slightly from the entered durations. Resampling applies anti-alias filtering; output bandwidth is limited by the native rate. The timing readout shows both synthesis and output rates.\n\n"
+            "FS (Hz): whole-number synthesis sample rate. Frequencies must be below FS / 2. For a DAQ, the prepared rate is FS. For speakers, one full cycle is resampled to the selected audio device's native rate BEFORE cycle repetition, plotting, saving, and playback. The cycle length rounds up to a whole output sample, so actual timing can differ slightly from the entered durations. Resampling applies anti-alias filtering; output bandwidth is limited by the native rate. The timing readout shows both synthesis and output rates.\n\n"
             "Amplitude: peak volts for DAQ output (0–10), or digital full-scale amplitude for speakers (0–1). Speaker volume also depends on macOS volume; this is not calibrated acoustic pressure. No automatic normalization is applied.\n\n"
-            "Repeats: positive integer number of identical cycles when Golay pairs are off, or complete A/B pairs when on. Every underlying cycle restarts the waveform and internal M-sequence phase.\n\n"
-            "Enable Golay pairs: uses each complete probe-plus-silence cycle as one Golay chip. Each +1 chip plays the cycle unchanged; each −1 chip reverses its sign (180° phase shift). Output order is A-coded cycles → gap → B-coded cycles → gap, repeated as complete pairs. Tone, Chirp, and M sequences all support this outer coding. The per-cycle edge taper is retained; no extra whole-code taper is applied.\n\n"
-            "Golay order: integer from 1 to 12; each member contains 2^order chips. Order 3 therefore uses eight cycles for A and eight for B. This does not change the internal M-sequence order.\n\n"
-            "Inter-code gap (s): additional silence after BOTH A and B, beyond the silence already in every chip. Source gap samples = floor(FS × gap); for speaker output, that duration is converted to the nearest whole native-rate sample.\n\n"
-            "Total playback duration: without Golay, prepared cycle samples × repeats / output rate. With Golay, 2 × (2^order × prepared cycle samples + prepared gap samples) × repeats / output rate. For T_cycle = 0.100 s, Golay order 3, gap = 0, and Repeats = 1, playback lasts 1.6 s. Higher orders increase duration and in-memory playback buffers exponentially. The displayed duration uses actual sample counts and remains available when a sequence exceeds the preview limit.\n\n"
-            "Golay decoding: separately matched-filter the received A and B members with their corresponding transmitted templates, align the responses, and sum them. Complementary coding cancels code sidelobes for an unchanged linear channel, leaving the underlying chip-waveform response. Finite waveform bandwidth, motion, channel changes, and nonlinear distortion limit the result. This GUI only transmits; it does not acquire or decode the returns. The saved WAV contains A, gap, B, gap, and any requested repeated pairs.\n\n"
-            "Save generated signal to WAV: writes the same prepared float32 buffer used by the previews and playback, including all repeats, Golay signs, gaps, and speaker resampling. The WAV header uses the PREPARED OUTPUT rate, which can differ from synthesis FS for speakers. Playback reads this buffer directly; it does not reload the WAV. Choose its path with Browse.\n\n"
-            "Start / Stop: Start captures one prepared buffer and its output device. Plots stay tied to that buffer while it is playing, even if signal parameters are edited; the new settings are prepared and shown after playback stops. The lag zoom and curve visibility controls still work while playing. Stop interrupts playback. The WAV, when enabled, contains the FULL prepared sequence even if playback is stopped early. Speaker playback explicitly uses the captured audio-device index.\n\n"
+            "Repeats: positive integer number of identical probe-plus-silence cycles. Every cycle restarts the waveform and internal M-sequence phase.\n\n"
+            "Total playback duration: prepared cycle samples × repeats / output rate. The displayed duration uses actual sample counts and remains available when a sequence exceeds the preview limit. Entire sequences are prepared in memory.\n\n"
+            "Save generated signal to WAV: writes the same prepared float32 buffer used by the previews and playback, including all repeats, duty-cycle silence, and speaker resampling. The WAV header uses the PREPARED OUTPUT rate, which can differ from synthesis FS for speakers. Playback reads this buffer directly; it does not reload the WAV. Choose its path with Browse.\n\n"
+            "Start / Stop: Start captures one prepared buffer and its output device. Plots stay tied to that buffer while it is playing, even if signal parameters are edited; the new settings are prepared and shown after playback stops. The lag zoom control still works while playing. Stop interrupts playback. The WAV, when enabled, contains the FULL prepared sequence even if playback is stopped early. Speaker playback explicitly uses the captured audio-device index.\n\n"
             "Previews, left to right: waveform (amplitude versus time, including repeats and silence); time-averaged PSD; spectrogram (frequency versus time); autocorrelation. All four plots use samples from the single prepared output buffer after float32 conversion and speaker resampling. The PSD averages the spectrogram's linear power densities, including silence, before conversion to dB. Segment detrending is disabled: subtracting an unweighted segment mean before Hann windowing can create a spurious near-DC feature. Finite probe duration, gating, and phase coding still produce real spectral spread outside nominal frequencies. These plots describe the intended electrical/digital waveform, not the transducer or speaker response. Preview limit: 2,000,000 prepared output samples. Larger sequences can still be saved/played but display a preview-limit message. Entire sequences are prepared in memory.\n\n"
-            "Autocorrelation: without Golay, shows the complete PREPARED OUTPUT buffer's aperiodic autocorrelation, including repeats and silence. With Golay, compares the prepared A and B member slices through A alone and the SIGNED sum R_A + R_B, excluding inter-code gaps and pair repetitions. The dashed One cycle curve uses the first complete cycle sliced from that same prepared buffer. Each curve is separately normalized to its zero-lag value, then shown as 20 × log10(abs(R) / R(0)), with a display floor of −100 dB. The normalized plot does not show processing gain. Silent signals are labeled rather than normalized.\n\n"
-            "Lag half-width (ms): positive width on EACH side of zero lag in the autocorrelation plot. The default 5 gives a fixed view from −5 to +5 ms. Change it to inspect a narrower central peak or wider sidelobe region. The same range is retained when toggling Golay, changing signal type, or changing repeats; this is a display setting and does not change playback or WAV samples. Lags are displayed in milliseconds.\n\n"
-            "Autocorrelation curves: the A + B, A only, and One cycle checkboxes independently show or hide the corresponding Golay comparison curves and legend entries. All start checked. Their selections survive parameter changes and toggling Golay. They are disabled when Golay is off, when the Full signal curve is shown instead. You may hide all three curves. These controls preserve the zoom and change only visibility; they do not recompute the signal or correlations or change playback/WAV samples.\n\n"
-            "Golay sidelobes: sum the signed correlations BEFORE taking magnitude. Ideally R_A + R_B = 2 × (chips per member) × R_cycle, with R_cycle centered and zero-padded to the member-correlation length. The combined curve should therefore overlap the normalized One cycle reference within its support and cancel beyond it. The cycle's own main lobe and sidelobes remain; a long tone chip can retain a broad oscillatory response. Autocorrelating the concatenated A–gap–B sequence is a different operation and does not demonstrate this cancellation. This is an ideal transmit-template diagnostic; real received data require separate matched filters and an unchanged linear channel.\n\n"
+            "Autocorrelation: shows the complete prepared output buffer's aperiodic autocorrelation, including repeats and silence. It is normalized to its zero-lag value and shown as 20 × log10(abs(R) / R(0)), with a display floor of −100 dB. This normalization does not show processing gain. Silent signals are labeled rather than normalized.\n\n"
+            "Lag half-width (ms): positive width on EACH side of zero lag in the autocorrelation plot. The default 5 gives a fixed view from −5 to +5 ms. Change it to inspect a narrower central peak or wider sidelobe region. The same range is retained when changing signal type or repeats; this is a display setting and does not change playback or WAV samples. Lags are displayed in milliseconds.\n\n"
             "Edge taper: a Tukey window with alpha = 0.1 smooths the first and last 5% of the active interval. This preserves the phase/frequency law while reducing abrupt burst edges. It does not smooth internal M-sequence phase switches."
         )
         descriptions = dict()
@@ -295,7 +253,7 @@ class ChirpTransmitApp:
             text.bold_font = tkfont.nametofont("TkDefaultFont").copy()
             text.bold_font.configure(weight="bold")
             text.tag_configure("parameter", font=text.bold_font)
-            for match in re.finditer(r"^(?:Fundamental frequency \(Hz\)|Start frequency \(Hz\)|Stop frequency \(Hz\)|Carrier frequency \(Hz\)|Sequence order|Device|AO channel|Signal type|T_cycle \(s\)|Duty-cycle %|FS \(Hz\)|Amplitude|Repeats|Enable Golay pairs|Golay order|Inter-code gap \(s\)|Total playback duration|Golay decoding|Save generated signal to WAV|Start / Stop|Previews, left to right|Autocorrelation|Autocorrelation curves|Lag half-width \(ms\)|Golay sidelobes|Edge taper):", text.get("1.0", "end-1c"), re.MULTILINE):
+            for match in re.finditer(r"^(?:Fundamental frequency \(Hz\)|Start frequency \(Hz\)|Stop frequency \(Hz\)|Carrier frequency \(Hz\)|Sequence order|Device|AO channel|Signal type|T_cycle \(s\)|Duty-cycle %|FS \(Hz\)|Amplitude|Repeats|Total playback duration|Save generated signal to WAV|Start / Stop|Previews, left to right|Autocorrelation|Lag half-width \(ms\)|Edge taper):", text.get("1.0", "end-1c"), re.MULTILINE):
                 text.tag_add("parameter", f"1.0+{match.start()}c", f"1.0+{match.end() - 1}c")
             text.config(state="disabled")
             if signal_type == self.signal_type_var.get():
@@ -303,7 +261,7 @@ class ChirpTransmitApp:
 
     def _update_preview(self):
         self.preview_after_id = None
-        self.golay_info_var.set("")
+        self.output_info_var.set("")
         if self.preview_colorbar is not None:
             self.preview_colorbar.remove()
             self.preview_colorbar = None
@@ -334,16 +292,14 @@ class ChirpTransmitApp:
             if not np.isfinite(lag_half_width_ms) or lag_half_width_ms <= 0:
                 raise ValueError("Lag half-width must be a finite, positive number of milliseconds.")
             prepared = self.active_output if self.running else self._prepare_output()
-            self.golay_info_var.set(prepared['description'])
+            self.output_info_var.set(prepared['description'])
             self.sequence_info_var.set(prepared['sequence_info'])
-            for checkbutton in self.autocorrelation_checkbuttons:
-                checkbutton.config(state="normal" if prepared['golay_enabled'] else "disabled")
             if prepared['total_samples'] > 2_000_000:
-                raise ValueError("Preview limited to 2,000,000 prepared output samples; reduce duration, repeats, or Golay order/gap.")
+                raise ValueError("Preview limited to 2,000,000 prepared output samples; reduce duration or repeats.")
         except Exception as exc:
             self.preview_frame.config(text="Output preview unavailable")
-            if not self.golay_info_var.get():
-                self.golay_info_var.set(str(exc))
+            if not self.output_info_var.get():
+                self.output_info_var.set(str(exc))
             self.preview_axes.text(0.5, 0.5, str(exc), ha="center", va="center", wrap=True, transform=self.preview_axes.transAxes)
             self.preview_canvas.draw_idle()
             return
@@ -378,61 +334,21 @@ class ChirpTransmitApp:
         mean_peak_db = max(float(np.max(mean_psd_db)), -160.0)
         self.psd_axes.set_ylim(mean_peak_db - 80, mean_peak_db + 5)
         self.psd_axes.grid(alpha=0.25)
-        self._plot_autocorrelation(data, cycle, fs, prepared['golay_enabled'], prepared['golay_order'], prepared['gap_samples'], lag_half_width_ms)
+        self._plot_autocorrelation(data, fs, lag_half_width_ms)
         self.preview_canvas.draw_idle()
 
-    def _plot_autocorrelation(self, data, cycle, fs, golay_enabled, golay_order, gap_samples, lag_half_width_ms):
+    def _plot_autocorrelation(self, data, fs, lag_half_width_ms):
         self.autocorrelation_axes.set_xlim(-lag_half_width_ms, lag_half_width_ms)
         # Promote the prepared float32 sample values for accurate correlation arithmetic.
-        cycle = np.asarray(cycle, dtype=np.float64)
-        if not np.any(cycle):
+        analysis_data = np.asarray(data, dtype=np.float64)
+        if not np.any(analysis_data):
             self.autocorrelation_axes.text(0.5, 0.5, "Silent signal\nAutocorrelation is zero", ha="center", va="center", transform=self.autocorrelation_axes.transAxes)
             return
-        if not golay_enabled:
-            analysis_data = np.asarray(data, dtype=np.float64)
-            correlation = correlate(analysis_data, analysis_data, mode="full", method="fft")
-            lags = 1000 * (np.arange(len(correlation)) - (len(data) - 1)) / fs
-            normalized_magnitude = np.abs(correlation) / correlation[len(data) - 1]
-            self.autocorrelation_axes.plot(lags, 20 * np.log10(np.maximum(normalized_magnitude, 1e-5)), label="Full signal")
-        else:
-            member_samples = (2**golay_order) * len(cycle)
-            a = np.asarray(data[:member_samples], dtype=np.float64)
-            b_start = member_samples + gap_samples
-            b = np.asarray(data[b_start:b_start + member_samples], dtype=np.float64)
-            r_a = correlate(a, a, mode="full", method="fft")
-            r_b = correlate(b, b, mode="full", method="fft")
-            combined = r_a + r_b
-            lags = 1000 * (np.arange(len(combined)) - (member_samples - 1)) / fs
-            a_magnitude = np.abs(r_a) / r_a[member_samples - 1]
-            combined_magnitude = np.abs(combined) / combined[member_samples - 1]
-            self.autocorrelation_axes.plot(lags, 20 * np.log10(np.maximum(a_magnitude, 1e-5)), label="A only", alpha=0.65)
-            self.autocorrelation_axes.plot(lags, 20 * np.log10(np.maximum(combined_magnitude, 1e-5)), label="A + B")
-            r_cycle = correlate(cycle, cycle, mode="full", method="fft")
-            cycle_lags = 1000 * (np.arange(len(r_cycle)) - (len(cycle) - 1)) / fs
-            cycle_magnitude = np.abs(r_cycle) / r_cycle[len(cycle) - 1]
-            self.autocorrelation_axes.plot(cycle_lags, 20 * np.log10(np.maximum(cycle_magnitude, 1e-5)), linestyle="--", label="One cycle")
-        self._update_autocorrelation_visibility()
-
-    def _update_autocorrelation_visibility(self, *args):
-        handles = []
-        labels = []
-        for line in self.autocorrelation_axes.lines:
-            label = line.get_label()
-            if label == "A + B":
-                line.set_visible(self.show_combined_var.get())
-            elif label == "A only":
-                line.set_visible(self.show_a_only_var.get())
-            elif label == "One cycle":
-                line.set_visible(self.show_one_cycle_var.get())
-            if line.get_visible():
-                handles.append(line)
-                labels.append(label)
-        legend = self.autocorrelation_axes.get_legend()
-        if legend is not None:
-            legend.remove()
-        if handles:
-            self.autocorrelation_axes.legend(handles=handles, labels=labels, loc="lower right")
-        self.preview_canvas.draw_idle()
+        correlation = correlate(analysis_data, analysis_data, mode="full", method="fft")
+        lags = 1000 * (np.arange(len(correlation)) - (len(data) - 1)) / fs
+        normalized_magnitude = np.abs(correlation) / correlation[len(data) - 1]
+        self.autocorrelation_axes.plot(lags, 20 * np.log10(np.maximum(normalized_magnitude, 1e-5)), label="Full signal")
+        self.autocorrelation_axes.legend(loc="lower right")
 
     def _browse_wav_path(self):
         path = filedialog.asksaveasfilename(title="Save signal WAV", defaultextension=".wav", initialfile=self.wav_path_var.get(), filetypes=[("WAV files", "*.wav")])
@@ -524,48 +440,12 @@ class ChirpTransmitApp:
         cycle[:n_active] = probe
         return cycle
 
-    def _read_golay_parameters(self, fs):
-        enabled = self.golay_enabled_var.get()
-        if not enabled:
-            return False, 3, 0
-        order = int(self.golay_order_var.get())
-        gap = float(self.golay_gap_var.get())
-        if order < 1 or order > 12:
-            raise ValueError("Golay order must be an integer from 1 to 12.")
-        if not np.isfinite(gap) or gap < 0:
-            raise ValueError("Inter-code gap must be a finite, nonnegative number of seconds.")
-        gap_samples = int(fs * gap)
-        return enabled, order, gap_samples
-
-    def _make_golay_pair(self, order):
-        a = np.ones(1)
-        b = np.ones(1)
-        for level in range(order):
-            next_a = np.concatenate((a, b))
-            next_b = np.concatenate((a, -b))
-            a = next_a
-            b = next_b
-        return a, b
-
-    def _make_output(self, cycle, repeats, golay_enabled, golay_order, gap_samples):
-        if not golay_enabled:
-            return np.tile(cycle, repeats)
-        a, b = self._make_golay_pair(golay_order)
-        member_samples = len(a) * len(cycle)
-        pair = np.zeros(2 * (member_samples + gap_samples))
-        b_start = member_samples + gap_samples
-        for chip in range(len(a)):
-            start = chip * len(cycle)
-            stop = start + len(cycle)
-            pair[start:stop] = a[chip] * cycle
-            pair[b_start + start:b_start + stop] = b[chip] * cycle
-        return np.tile(pair, repeats)
+    def _make_output(self, cycle, repeats):
+        return np.tile(cycle, repeats)
 
     def _prepare_output(self, for_playback=False):
         parameters = self._read_parameters()
         signal_type, f0, f1, t_cycle, duty_cycle, source_fs, amplitude, repeats, order = parameters
-        golay_settings = self._read_golay_parameters(source_fs)
-        golay_enabled, golay_order, source_gap_samples = golay_settings
         device = self.device_var.get()
         channel = self._normalize_ao_channel(self.ao_channel_var.get())
         source_fs = int(source_fs)
@@ -582,7 +462,7 @@ class ChirpTransmitApp:
             audio_device = output["index"]
             output_name = output["name"]
             sd.check_output_settings(device=audio_device, channels=1, dtype="float32", samplerate=output_fs)
-        key = (device, channel, parameters, golay_settings, output_fs, audio_device, output_name)
+        key = (device, channel, parameters, output_fs, audio_device, output_name)
         if self.prepared_output is not None and self.prepared_output['key'] == key:
             if self.prepared_output['data'] is not None or not for_playback:
                 return self.prepared_output
@@ -590,13 +470,8 @@ class ChirpTransmitApp:
         ratio = Fraction(output_fs, source_fs)
         source_cycle_samples = int(t_cycle * source_fs)
         cycle_samples = (source_cycle_samples * ratio.numerator + ratio.denominator - 1) // ratio.denominator
-        gap_samples = int(round(source_gap_samples * output_fs / source_fs))
-        if golay_enabled:
-            total_samples = 2 * ((2**golay_order) * cycle_samples + gap_samples) * repeats
-            sequence_description = f"{2**golay_order} chips/member | A → gap → B → gap | {repeats} pair(s)"
-        else:
-            total_samples = cycle_samples * repeats
-            sequence_description = f"{repeats} cycle(s)"
+        total_samples = cycle_samples * repeats
+        sequence_description = f"{repeats} cycle(s)"
         prepared = dict()
         prepared['key'] = key
         prepared['device'] = device
@@ -605,9 +480,6 @@ class ChirpTransmitApp:
         prepared['output_name'] = output_name
         prepared['source_fs'] = source_fs
         prepared['fs'] = output_fs
-        prepared['golay_enabled'] = golay_enabled
-        prepared['golay_order'] = golay_order
-        prepared['gap_samples'] = gap_samples
         prepared['cycle_samples'] = cycle_samples
         prepared['total_samples'] = total_samples
         prepared['description'] = f"{sequence_description} | Total playback duration: {total_samples / output_fs:.6g} s | Output: {output_fs} Hz (synthesis: {source_fs} Hz)"
@@ -629,7 +501,7 @@ class ChirpTransmitApp:
         cycle = np.asarray(cycle, dtype=np.float32)
         if device == SPEAKER_DEVICE and np.max(np.abs(cycle)) > 1:
             raise ValueError("Prepared speaker samples exceed full scale after resampling; lower the amplitude.")
-        data = np.ascontiguousarray(self._make_output(cycle, repeats, golay_enabled, golay_order, gap_samples), dtype=np.float32)
+        data = np.ascontiguousarray(self._make_output(cycle, repeats), dtype=np.float32)
         data.setflags(write=False)
         prepared['data'] = data
         prepared['cycle'] = data[:cycle_samples]
