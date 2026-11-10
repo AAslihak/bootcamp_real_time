@@ -32,7 +32,7 @@ MAX_BUFFER_SAMPLES = 8191
 class DAQMonitorApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("NI DAQ Multi-Channel Monitor")
+        self.root.title("NI DAQ Multi-Channel Monitor (buffer fix v2)")
         self.root.geometry("1100x800")
 
         self.channels = ["ai0", "ai1", "ai2", "ai3"]
@@ -53,6 +53,8 @@ class DAQMonitorApp:
         self.output_file_var = tk.StringVar(value="daq_capture.wav")
         self.save_dir_var = tk.StringVar(value=os.path.abspath("."))
         self.status_var = tk.StringVar(value="Idle")
+        self.plot_enabled_var = tk.BooleanVar(value=True)
+        self.start_time = None
 
         self._build_ui()
         self._init_plot()
@@ -70,6 +72,9 @@ class DAQMonitorApp:
 
         ttk.Label(control_frame, text="Input range (+/- V):").grid(row=0, column=4, sticky="w", padx=5, pady=5)
         ttk.Entry(control_frame, textvariable=self.v_range_var, width=10).grid(row=0, column=5, padx=5, pady=5)
+
+        # turn the live plot off to test whether plotting is causing the buffer overflow
+        ttk.Checkbutton(control_frame, text="Live plot", variable=self.plot_enabled_var).grid(row=0, column=7, padx=10, pady=5)
 
         ttk.Label(control_frame, text="File name:").grid(row=1, column=0, sticky="w", padx=5, pady=5)
         ttk.Entry(control_frame, textvariable=self.output_file_var, width=24).grid(row=1, column=1, padx=5, pady=5)
@@ -118,7 +123,7 @@ class DAQMonitorApp:
         with self.data_lock:
             history = self.history.copy()
 
-        if self.running and history.size > 0:
+        if self.running and self.plot_enabled_var.get() and history.size > 0:
             display_n = min(history.shape[0], max(2000, int(float(self.sample_rate_var.get()) * 0.5)))
             y = history[-display_n:]
             sample_rate = max(float(self.sample_rate_var.get()), 1e-6)
@@ -195,6 +200,7 @@ class DAQMonitorApp:
         try:
             import nidaqmx
             from nidaqmx.constants import AcquisitionType, TerminalConfiguration
+            from nidaqmx.stream_readers import AnalogMultiChannelReader
 
             device = self.device_var.get().strip() or "Dev1"
             sample_rate = float(self.sample_rate_var.get())
@@ -219,19 +225,26 @@ class DAQMonitorApp:
                 # hold 10 s of data per channel in the driver buffer
                 # so a slow plot redraw cannot overflow it
                 task.in_stream.input_buf_size = int(sample_rate * 10)
+                actual_buf = task.in_stream.input_buf_size
+
+                # numpy stream reader is much faster than task.read(), which builds Python lists
+                reader = AnalogMultiChannelReader(task.in_stream)
+                read_buf = np.zeros((len(self.channels), block_size), dtype=np.float64)
+
                 task.start()
+                self.start_time = time.time()
+                self.status_var.set(
+                    f"Running... {sample_rate:.0f} Hz, read block {block_size}, "
+                    f"driver buffer {actual_buf} samples/ch ({actual_buf / sample_rate:.1f} s)"
+                )
 
                 while not self.stop_event.is_set():
-                    data = task.read(number_of_samples_per_channel=block_size, timeout=5.0)
-                    arr = np.asarray(data, dtype=np.float64)
-                    if arr.ndim == 1:
-                        arr = arr.reshape(-1, 1)
-                    if arr.shape[1] != len(self.channels):
-                        # sometimes DAQ returns data as (samples,) or (channels, samples)
-                        if arr.shape[0] == len(self.channels):
-                            arr = arr.T
-                        else:
-                            arr = arr.reshape(-1, len(self.channels))
+                    reader.read_many_sample(
+                        read_buf,
+                        number_of_samples_per_channel=block_size,
+                        timeout=5.0,
+                    )
+                    arr = read_buf.T.copy()  # (samples, channels)
 
                     self._append_to_history(arr)
                     if self.log_enabled_var.get():
@@ -242,7 +255,8 @@ class DAQMonitorApp:
             self.status_var.set("Stopped")
 
         except Exception as exc:
-            self.status_var.set(f"Error: {exc}")
+            elapsed = time.time() - self.start_time if self.start_time else 0.0
+            self.status_var.set(f"Error after {elapsed:.1f} s: {exc}")
             messagebox.showerror("DAQ Error", str(exc))
         finally:
             # save whatever was logged, even if acquisition stopped on an error
@@ -266,6 +280,7 @@ class DAQMonitorApp:
             return
 
         self.running = True
+        self.start_time = None
         self.stop_event = threading.Event()
         self.history = np.empty((0, len(self.channels)))
         self.log_chunks = []
