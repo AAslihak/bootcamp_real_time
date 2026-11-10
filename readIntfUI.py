@@ -3,6 +3,7 @@ readIntfUI.py  (v3)
 
 Real-time monitor and recorder for NI DAQ analog inputs.
 
+<<<<<<< Updated upstream
 Acquisition settings (need a restart, use Apply):
     device, channels, sample rate, input range, terminal configuration
 
@@ -22,6 +23,14 @@ Device name "SIM" runs a simulated 3-15 kHz chirp source so the UI can be
 tested without hardware.
 
 WAV files are 32-bit float, in volts, readable with MATLAB audioread().
+=======
+Features:
+- adjustable sample rate and read block size
+- device address entry
+- start/stop controls
+- optional WAV logging
+- notes box saved with the data file metadata
+>>>>>>> Stashed changes
 """
 
 import json
@@ -40,6 +49,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from scipy import signal
 
 
+<<<<<<< Updated upstream
 APP_TITLE = "NI DAQ Multi-Channel Monitor v3"
 RATE_PRESETS = ["50000", "100000", "200000", "500000", "1000000", "2000000"]
 RANGE_PRESETS = ["0.2", "0.5", "1", "2", "5", "10"]
@@ -47,6 +57,11 @@ TERMINAL_CHOICES = ["DIFF", "PSEUDO_DIFF", "RSE", "NRSE"]
 NFFT_CHOICES = ["256", "512", "1024", "2048", "4096", "8192", "16384"]
 VIEW_CHOICES = ["Time", "Spectrum", "Spectrogram"]
 LAYOUT_CHOICES = ["Per-channel files", "One multichannel file"]
+=======
+MAX_BUFFER_SAMPLES = 8191
+DEFAULT_READ_BLOCK_SAMPLES = 880
+UI_REFRESH_INTERVAL_MS = 20
+>>>>>>> Stashed changes
 
 RING_SECONDS = 10.0             # history kept for display and snapshots
 RING_MAX_VALUES = 64_000_000    # cap on stored float32 values (~256 MB)
@@ -454,6 +469,7 @@ class DAQMonitorApp:
         # acquisition state
         self.running = False
         self.stop_event = None
+<<<<<<< Updated upstream
         self.acq_thread = None
         self.cfg = None
         self.ring = None
@@ -470,6 +486,24 @@ class DAQMonitorApp:
         self.ui_q = queue.Queue()
         self.writer_thread = threading.Thread(target=self._writer_loop, daemon=True)
         self.writer_thread.start()
+=======
+        self.thread = None
+        self.latest_block = np.empty((0, len(self.channels)))
+        self.log_chunks = []
+        self.log_path = None
+        self.recording_sample_rate = None
+        self.recording_block_size = DEFAULT_READ_BLOCK_SAMPLES
+        self.recording_log_enabled = False
+
+        self.sample_rate_var = tk.StringVar(value="44000")
+        self.block_size_var = tk.StringVar(value=str(DEFAULT_READ_BLOCK_SAMPLES))
+        self.device_var = tk.StringVar(value="Dev1")
+        self.v_range_var = tk.StringVar(value="5.0")
+        self.log_enabled_var = tk.BooleanVar(value=False)
+        self.output_file_var = tk.StringVar(value="daq_capture.wav")
+        self.save_dir_var = tk.StringVar(value=os.path.abspath("."))
+        self.status_var = tk.StringVar(value="Idle")
+>>>>>>> Stashed changes
 
         # plot state
         self.layout_key = None
@@ -483,8 +517,12 @@ class DAQMonitorApp:
         self._make_vars()
         self._build_ui()
         self._init_plot()
+<<<<<<< Updated upstream
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(200, self._tick)
+=======
+        self.root.after(UI_REFRESH_INTERVAL_MS, self._update_ui)
+>>>>>>> Stashed changes
 
     # ------------------------------------------------------------------ vars
     def _make_vars(self):
@@ -596,9 +634,29 @@ class DAQMonitorApp:
         ttk.Entry(rec, textvariable=self.snap_var, width=6).grid(row=1, column=7, sticky="w", **pad)
         ttk.Button(rec, text="Save last N s", command=self.save_snapshot).grid(row=1, column=8, sticky="w", **pad)
 
+<<<<<<< Updated upstream
         notes = ttk.LabelFrame(self.root, text="Data notes (saved in each recording's .json)", padding=6)
         notes.pack(fill="x", padx=8, pady=4)
         self.notes_box = tk.Text(notes, height=2, width=140)
+=======
+        ttk.Button(control_frame, text="Start", command=self.start_acquisition).grid(row=1, column=8, padx=10, pady=5)
+        ttk.Button(control_frame, text="Stop", command=self.stop_acquisition).grid(row=1, column=9, padx=10, pady=5)
+
+        ttk.Label(control_frame, text="Read block size (samples/channel):").grid(
+            row=2, column=0, columnspan=2, sticky="w", padx=5, pady=5)
+        ttk.Entry(control_frame, textvariable=self.block_size_var, width=12).grid(
+            row=2, column=2, padx=5, pady=5, sticky="w")
+        ttk.Label(control_frame, text="Applied on Start").grid(
+            row=2, column=3, sticky="w", padx=5, pady=5)
+
+        ttk.Label(control_frame, textvariable=self.status_var, foreground="darkblue").grid(row=3, column=0, columnspan=10, sticky="w", padx=5, pady=(0, 5))
+
+        # notes box for metadata header
+        notes_frame = ttk.LabelFrame(self.root, text="Data Notes / Header", padding=8)
+        notes_frame.pack(fill="x", side="top", padx=10, pady=(0, 10))
+
+        self.notes_box = tk.Text(notes_frame, height=4, width=140)
+>>>>>>> Stashed changes
         self.notes_box.insert("1.0", "DAQ capture notes\n")
         self.notes_box.pack(fill="x")
 
@@ -616,11 +674,43 @@ class DAQMonitorApp:
         self.canvas = FigureCanvasTkAgg(self.fig, master=self.plot_frame)
         self.canvas.get_tk_widget().pack(fill="both", expand=True)
 
+<<<<<<< Updated upstream
+=======
+    def _update_ui(self):
+        with self.data_lock:
+            latest_block = self.latest_block.copy()
+
+        if self.running and latest_block.size > 0:
+            y = latest_block
+            sample_rate = max(float(self.sample_rate_var.get()), 1e-6)
+            t = np.arange(y.shape[0]) / sample_rate
+            time_window = max(1.0 / sample_rate, y.shape[0] / sample_rate)
+            for idx, line in enumerate(self.lines):
+                line.set_data(t, y[:, idx])
+                self.axs[idx].set_xlim(0, time_window)
+                if y.size:
+                    ymin = np.min(y[:, idx])
+                    ymax = np.max(y[:, idx])
+                    pad = max(0.05, 0.1 * max(abs(ymin), abs(ymax), 1.0))
+                    self.axs[idx].set_ylim(ymin - pad, ymax + pad)
+            self.canvas.draw_idle()
+
+        self.root.after(UI_REFRESH_INTERVAL_MS, self._update_ui)
+
+    def _set_latest_block(self, data):
+        if data.size == 0:
+            return
+        with self.data_lock:
+            new_data = np.asarray(data, dtype=np.float64).reshape(-1, len(self.channels))
+            self.latest_block = new_data[-self.max_buffer_frames:]
+
+>>>>>>> Stashed changes
     def _browse_save_dir(self):
         folder = filedialog.askdirectory(initialdir=self.save_dir_var.get() or os.path.abspath("."))
         if folder:
             self.save_dir_var.set(folder)
 
+<<<<<<< Updated upstream
     def _rebuild_channel_widgets(self, channels):
         for w in self.vis_frame.winfo_children():
             w.destroy()
@@ -645,6 +735,53 @@ class DAQMonitorApp:
     # ------------------------------------------------------------- numbers
     @staticmethod
     def _num(var, default, lo=None, hi=None):
+=======
+    def _save_logged_data(self):
+        if not self.recording_log_enabled:
+            return
+
+        if len(self.log_chunks) == 0:
+            return
+
+        save_dir = self.save_dir_var.get().strip() or os.path.abspath(".")
+        os.makedirs(save_dir, exist_ok=True)
+
+        fname = self.output_file_var.get().strip() or "daq_capture.wav"
+        base_name = os.path.splitext(fname)[0]
+        if not base_name:
+            base_name = "daq_capture"
+
+        data = np.concatenate(self.log_chunks, axis=0)
+        if data.shape[1] != len(self.channels):
+            data = data.reshape(-1, len(self.channels))
+
+        data = np.asarray(data, dtype=np.float32)
+        sample_rate = self.recording_sample_rate or float(self.sample_rate_var.get())
+        for idx, channel in enumerate(self.channels):
+            channel_path = os.path.join(save_dir, f"{base_name}_{channel}.wav")
+            wavfile.write(
+                channel_path,
+                int(round(sample_rate)),
+                data[:, idx],
+            )
+
+            metadata = {
+                "device": self.device_var.get(),
+                "sample_rate_hz": sample_rate,
+                "read_block_samples_per_channel": self.recording_block_size,
+                "channel": channel,
+                "input_range_v": float(self.v_range_var.get()),
+                "notes": self.notes_box.get("1.0", "end-1c").strip(),
+                "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            meta_path = os.path.splitext(channel_path)[0] + ".json"
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(metadata, f, indent=2)
+
+        self.log_path = os.path.join(save_dir, base_name)
+
+    def _acquire_loop(self):
+>>>>>>> Stashed changes
         try:
             x = float(var.get())
         except (ValueError, tk.TclError):
@@ -655,6 +792,7 @@ class DAQMonitorApp:
             x = min(hi, x)
         return x
 
+<<<<<<< Updated upstream
     def _read_cfg(self):
         channels = parse_channels(self.channels_var.get())
         rate = float(self.rate_var.get())
@@ -668,6 +806,66 @@ class DAQMonitorApp:
             "v_range": v_range,
             "terminal": self.terminal_var.get(),
         }
+=======
+            device = self.device_var.get().strip() or "Dev1"
+            sample_rate = float(self.sample_rate_var.get())
+            self.recording_sample_rate = sample_rate
+            v_range = float(self.v_range_var.get())
+            # The read size is independent of the plot's display limit.
+            block_size = self.recording_block_size
+            input_buffer_size = max(block_size * 2, int(sample_rate * 0.1))
+
+            with nidaqmx.Task() as task:
+                for ch in self.channels:
+                    task.ai_channels.add_ai_voltage_chan(
+                        f"{device}/{ch}",
+                        min_val=-v_range,
+                        max_val=v_range,
+                        terminal_config=TerminalConfiguration.DIFF,
+                    )
+
+                task.timing.cfg_samp_clk_timing(
+                    sample_rate,
+                    sample_mode=AcquisitionType.CONTINUOUS,
+                    samps_per_chan=input_buffer_size,
+                )
+                task.in_stream.input_buf_size = input_buffer_size
+                task.start()
+
+                while not self.stop_event.is_set():
+                    data = task.read(
+                        number_of_samples_per_channel=block_size,
+                        timeout=5.0 + block_size / sample_rate,
+                    )
+                    # Multi-channel DAQmx reads return channels first, including
+                    # when the read size equals the number of channels.
+                    arr = np.asarray(data, dtype=np.float64).reshape(len(self.channels), -1).T
+
+                    self._set_latest_block(arr)
+                    if self.recording_log_enabled:
+                        self.log_chunks.append(arr.copy())
+
+                task.stop()
+
+            self._save_logged_data()
+            self.status_var.set("Stopped")
+
+        except Exception as exc:
+            self.status_var.set(f"Error: {exc}")
+            error_message = str(exc)
+            try:
+                self._save_logged_data()
+            except Exception as save_exc:
+                error_message += f"\n\nWAV save also failed: {save_exc}"
+            else:
+                if self.recording_log_enabled and self.log_chunks:
+                    error_message += "\n\nThe samples successfully read before the error were saved."
+            messagebox.showerror("DAQ Error", error_message)
+        finally:
+            self.running = False
+            self.stop_event = None
+            self.thread = None
+>>>>>>> Stashed changes
 
     # --------------------------------------------------------- acquisition
     def start_acquisition(self):
@@ -678,17 +876,50 @@ class DAQMonitorApp:
         except ValueError as exc:
             messagebox.showerror("Invalid settings", str(exc))
             return
+<<<<<<< Updated upstream
         self.cfg = cfg
         self._rebuild_channel_widgets(cfg["channels"])
+=======
+
+        try:
+            block_size = int(self.block_size_var.get())
+            if block_size <= 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Invalid input", "Read block size must be a positive integer (samples per channel).")
+            return
+
+        self.recording_block_size = block_size
+>>>>>>> Stashed changes
         self.running = True
         self.overflows = 0
         self.backlog_frac = 0.0
         self.ring = None
         self.actual_rate = None
         self.stop_event = threading.Event()
+<<<<<<< Updated upstream
         self.status_var.set("Starting...")
         self.acq_thread = threading.Thread(target=self._acq_loop, args=(cfg, self.stop_event), daemon=True)
         self.acq_thread.start()
+=======
+        self.recording_log_enabled = self.log_enabled_var.get()
+        self.recording_sample_rate = None
+        self.latest_block = np.empty((0, len(self.channels)))
+        self.log_chunks = []
+        self.log_path = None
+
+        if self.recording_log_enabled:
+            save_dir = self.save_dir_var.get().strip() or os.path.abspath(".")
+            os.makedirs(save_dir, exist_ok=True)
+            base_name = self.output_file_var.get().strip() or f"daq_capture_{datetime.now().strftime('%Y%m%d_%H%M%S')}.wav"
+            if not base_name.lower().endswith(".wav"):
+                base_name += ".wav"
+            self.log_path = os.path.join(save_dir, base_name)
+
+        self.status_var.set("Running...")
+        self.thread = threading.Thread(target=self._acquire_loop, daemon=True)
+        self.thread.start()
+>>>>>>> Stashed changes
 
     def stop_acquisition(self):
         if not self.running or self.stop_event is None:
