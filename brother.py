@@ -40,8 +40,9 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from scipy import signal
 
 
-APP_TITLE = "NI DAQ Multi-Channel Monitor v3.1"
-RATE_PRESETS = ["50000", "100000", "200000", "500000", "1000000", "2000000"]
+APP_TITLE = "NI DAQ Multi-Channel Monitor v3.2"
+RATE_PRESETS = ["44000", "50000", "100000", "200000", "500000", "1000000", "2000000"]
+SAMPS_PRESETS = ["Auto", "500", "1000", "2000", "5000", "10000", "20000", "50000", "100000", "200000"]
 RANGE_PRESETS = ["0.2", "0.5", "1", "2", "5", "10"]
 TERMINAL_CHOICES = ["DIFF", "PSEUDO_DIFF", "RSE", "NRSE"]
 NFFT_CHOICES = ["256", "512", "1024", "2048", "4096", "8192", "16384"]
@@ -370,17 +371,17 @@ class NISource:
         self.task.timing.cfg_samp_clk_timing(
             rate,
             sample_mode=self._AcqType.CONTINUOUS,
-            samps_per_chan=max(1000, int(rate * 0.05)),
+            samps_per_chan=cfg.get("samps") or max(1000, int(rate * 0.05)),
         )
         try:
             self.rate = float(self.task.timing.samp_clk_rate)  # actual (coerced) rate
         except Exception:
             self.rate = rate
-        self.block = max(1000, int(self.rate * 0.05))  # read 50 ms per call
+        self.block = cfg.get("samps") or max(1000, int(self.rate * 0.05))  # samples per channel per read
 
         buf_seconds = 10.0 if self.rate <= 500e3 else 4.0
         try:
-            self.task.in_stream.input_buf_size = int(self.rate * buf_seconds)
+            self.task.in_stream.input_buf_size = int(max(self.rate * buf_seconds, 4 * self.block))
         except Exception:
             self.notes.append("could not enlarge driver buffer")
         try:
@@ -449,8 +450,8 @@ class SimSource:
     def __init__(self, cfg):
         self.rate = float(cfg["rate"])
         self.nch = len(cfg["channels"])
-        self.block = max(1000, int(self.rate * 0.05))
-        self.buf_frames = int(self.rate * 10)
+        self.block = cfg.get("samps") or max(1000, int(self.rate * 0.05))
+        self.buf_frames = int(max(self.rate * 10, 4 * self.block))
         self.n = 0
         self.t0 = None
         try:
@@ -586,6 +587,7 @@ class DAQMonitorApp:
         self.device_var = v(value="Dev1")
         self.channels_var = v(value="ai0:3")
         self.rate_var = v(value="200000")
+        self.samps_var = v(value="Auto")
         self.range_var = v(value="5")
         self.terminal_var = v(value="DIFF")
 
@@ -615,23 +617,39 @@ class DAQMonitorApp:
     def _build_ui(self):
         pad = dict(padx=4, pady=3)
 
-        acq = ttk.LabelFrame(self.root, text="Acquisition (press Apply to change while running)", padding=6)
+        acq = ttk.LabelFrame(self.root, text="Acquisition (press Apply or Enter to change while running)", padding=6)
         acq.pack(fill="x", padx=8, pady=(8, 4))
         ttk.Label(acq, text="Device:").grid(row=0, column=0, sticky="w", **pad)
-        ttk.Entry(acq, textvariable=self.device_var, width=10).grid(row=0, column=1, **pad)
+        ttk.Entry(acq, textvariable=self.device_var, width=10).grid(row=0, column=1, sticky="w", **pad)
         ttk.Label(acq, text="Channels:").grid(row=0, column=2, sticky="w", **pad)
-        ttk.Entry(acq, textvariable=self.channels_var, width=12).grid(row=0, column=3, **pad)
-        ttk.Label(acq, text="Sample rate (S/s per ch):").grid(row=0, column=4, sticky="w", **pad)
-        ttk.Combobox(acq, textvariable=self.rate_var, values=RATE_PRESETS, width=10).grid(row=0, column=5, **pad)
-        ttk.Label(acq, text="Input range (+/- V):").grid(row=0, column=6, sticky="w", **pad)
-        ttk.Combobox(acq, textvariable=self.range_var, values=RANGE_PRESETS, width=6).grid(row=0, column=7, **pad)
-        ttk.Label(acq, text="Terminal:").grid(row=0, column=8, sticky="w", **pad)
+        ttk.Entry(acq, textvariable=self.channels_var, width=12).grid(row=0, column=3, sticky="w", **pad)
+        ttk.Label(acq, text="Input range (+/- V):").grid(row=0, column=4, sticky="w", **pad)
+        ttk.Combobox(acq, textvariable=self.range_var, values=RANGE_PRESETS, width=6).grid(row=0, column=5, sticky="w", **pad)
+        ttk.Label(acq, text="Terminal:").grid(row=0, column=6, sticky="w", **pad)
         ttk.Combobox(acq, textvariable=self.terminal_var, values=TERMINAL_CHOICES, width=11,
-                     state="readonly").grid(row=0, column=9, **pad)
-        self.start_btn = ttk.Button(acq, text="Start", command=self.start_acquisition)
-        self.start_btn.grid(row=0, column=10, **pad)
-        ttk.Button(acq, text="Stop", command=self.stop_acquisition).grid(row=0, column=11, **pad)
-        ttk.Button(acq, text="Apply", command=self.apply_settings).grid(row=0, column=12, **pad)
+                     state="readonly").grid(row=0, column=7, sticky="w", **pad)
+
+        # sample rate and samples per channel: arrows step through presets, or type any value
+        ttk.Label(acq, text="Sample rate (S/s/ch):").grid(row=1, column=0, columnspan=2, sticky="w", **pad)
+        rate_box = tk.Spinbox(acq, values=RATE_PRESETS, textvariable=self.rate_var, width=10)
+        rate_box.grid(row=1, column=2, sticky="w", **pad)
+        ttk.Label(acq, text="Samples/ch per read:").grid(row=1, column=3, columnspan=2, sticky="w", **pad)
+        samps_box = tk.Spinbox(acq, values=SAMPS_PRESETS, textvariable=self.samps_var, width=10)
+        samps_box.grid(row=1, column=5, sticky="w", **pad)
+        self.rate_var.set("200000")   # Spinbox resets its variable to the first preset on creation
+        self.samps_var.set("Auto")
+        for box in (rate_box, samps_box):
+            box.bind("<Return>", lambda e: self.apply_settings())
+        self.read_info_label = tk.Label(acq, text="", anchor="w", width=38)
+        self.read_info_label.grid(row=1, column=6, columnspan=3, sticky="w", **pad)
+
+        btns = ttk.Frame(acq)
+        btns.grid(row=0, column=9, rowspan=2, sticky="e", padx=(12, 0))
+        self.start_btn = ttk.Button(btns, text="Start", command=self.start_acquisition)
+        self.start_btn.grid(row=0, column=0, **pad)
+        ttk.Button(btns, text="Stop", command=self.stop_acquisition).grid(row=0, column=1, **pad)
+        ttk.Button(btns, text="Apply", command=self.apply_settings).grid(row=1, column=0, columnspan=2,
+                                                                         sticky="ew", **pad)
 
         disp = ttk.LabelFrame(self.root, text="Display (changes take effect immediately)", padding=6)
         disp.pack(fill="x", padx=8, pady=4)
@@ -672,14 +690,14 @@ class DAQMonitorApp:
         rec = ttk.LabelFrame(self.root, text="Recording (start and stop any time while acquiring)", padding=6)
         rec.pack(fill="x", padx=8, pady=4)
         ttk.Label(rec, text="Folder:").grid(row=0, column=0, sticky="w", **pad)
-        ttk.Entry(rec, textvariable=self.save_dir_var, width=40).grid(row=0, column=1, columnspan=3, sticky="ew", **pad)
+        ttk.Entry(rec, textvariable=self.save_dir_var, width=28).grid(row=0, column=1, columnspan=3, sticky="ew", **pad)
         ttk.Button(rec, text="Browse", command=self._browse_save_dir).grid(row=0, column=4, **pad)
         ttk.Label(rec, text="Base name:").grid(row=0, column=5, sticky="w", **pad)
         ttk.Entry(rec, textvariable=self.base_var, width=16).grid(row=0, column=6, **pad)
         ttk.Label(rec, text="Files:").grid(row=0, column=7, sticky="w", **pad)
-        ttk.Combobox(rec, textvariable=self.layout_var, values=LAYOUT_CHOICES, width=20,
+        ttk.Combobox(rec, textvariable=self.layout_var, values=LAYOUT_CHOICES, width=18,
                      state="readonly").grid(row=0, column=8, **pad)
-        ttk.Label(rec, text="New part every (s):").grid(row=0, column=9, sticky="w", **pad)
+        ttk.Label(rec, text="Split every (s):").grid(row=0, column=9, sticky="w", **pad)
         ttk.Entry(rec, textvariable=self.split_var, width=6).grid(row=0, column=10, **pad)
 
         self.rec_btn = ttk.Button(rec, text="Record", command=self.toggle_recording)
@@ -749,16 +767,50 @@ class DAQMonitorApp:
             x = min(hi, x)
         return x
 
+    @staticmethod
+    def _parse_samps(text):
+        text = str(text).strip()
+        if text == "" or text.lower().startswith("auto"):
+            return None
+        n = int(float(text))
+        if n < 10:
+            raise ValueError("Samples per channel must be at least 10 (or Auto).")
+        return n
+
+    def _update_read_info(self):
+        """Live hint next to the rate and samples boxes."""
+        try:
+            rate = float(self.rate_var.get())
+            samps = self._parse_samps(self.samps_var.get())
+            if rate <= 0:
+                raise ValueError
+        except (ValueError, tk.TclError):
+            self.read_info_label.config(text="Enter a number (samples: number or Auto)", fg="red")
+            return
+        n = samps if samps is not None else max(1000, int(rate * 0.05))
+        txt = f"= {n:,} samples, {1000 * n / rate:.1f} ms per read"
+        color = "black"
+        if self.running and self.cfg is not None:
+            if rate != self.cfg["rate"] or samps != self.cfg.get("samps"):
+                txt += "  (press Apply)"
+                color = "darkorange"
+        elif rate / n > 100:
+            txt += "  (too small, may overflow)"
+            color = "darkorange"
+        self.read_info_label.config(text=txt, fg=color)
+
     def _read_cfg(self):
         channels = parse_channels(self.channels_var.get())
         rate = float(self.rate_var.get())
         v_range = float(self.range_var.get())
+        samps = self._parse_samps(self.samps_var.get())
         if rate <= 0 or v_range <= 0:
             raise ValueError("Sample rate and input range must be positive.")
         return {
             "device": self.device_var.get().strip() or "Dev1",
             "channels": channels,
             "rate": rate,
+            "samps": samps,
             "v_range": v_range,
             "terminal": self.terminal_var.get(),
         }
@@ -967,6 +1019,7 @@ class DAQMonitorApp:
     # ------------------------------------------------------------ ui loop
     def _tick(self):
         self._drain_ui_queue()
+        self._update_read_info()
         if self.running and self.ring is not None and self.actual_rate:
             self._update_status()
             if self.live_var.get() and not self.freeze_var.get():
@@ -989,6 +1042,8 @@ class DAQMonitorApp:
             if kind == "started":
                 self.start_info = payload
                 self.rate_var.set(f"{payload['rate']:.0f}")
+                if self.cfg is not None:
+                    self.cfg["rate"] = float(f"{payload['rate']:.0f}")
                 if self.resume_recording:
                     self.resume_recording = False
                     self.start_recording()
@@ -1024,7 +1079,7 @@ class DAQMonitorApp:
         info = getattr(self, "start_info", None)
         if not info:
             return
-        txt = (f"Running | {info['rate']:,.0f} S/s per ch (actual) | read block {info['block']:,} | "
+        txt = (f"Running | {info['rate']:,.0f} S/s per ch (actual) | {info['block']:,} samples/ch per read | "
                f"driver buffer {info['buf_frames']:,}/ch ({info['buf_frames'] / info['rate']:.1f} s) | "
                f"backlog {100 * self.backlog_frac:.0f}% | overflows {self.overflows}")
         if info.get("info"):
