@@ -23,6 +23,7 @@ import numpy as np
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from scipy.signal import spectrogram, resample_poly, max_len_seq, correlate, firwin, hilbert
+from scipy.fft import next_fast_len
 from scipy.signal.windows import tukey
 
 
@@ -224,8 +225,8 @@ class ChirpTransmitApp:
             "Device: choose an NI DAQ or 'default (laptop speaker)'. The speaker option uses the macOS default audio output; select MacBook Speakers in System Settings if needed.\n\n"
             "AO channel: the DAQ analog output connected to your source amplifier. Not used for speaker playback.\n\n"
             "Signal type: selects Tone, Chirp, or M sequences and shows only the relevant fields.\n\n"
-            "T_cycle (s): length of one complete probe-plus-silence cycle. Repeats includes both portions. Tone and Chirp use floor(FS × T_cycle) source samples. M sequences use nearest-sample rounding, round(FS × T_cycle), and report the actual source cycle duration.\n\n"
-            "Duty-cycle %: requested active fraction at the start of each cycle; the remainder is zero. 0% gives silence. Tone and Chirp use floor(cycle samples × duty-cycle / 100) active samples. M sequences fit a complete, equal-chip sequence inside the nearest-sample active budget; leftover samples are silent. The actual M-sequence duty may therefore be below the request, including at 100%.\n\n"
+            "T_cycle (s): length of one complete probe-plus-silence cycle. Repeats includes both portions. All signal types use nearest-sample rounding, round(FS × T_cycle). M sequences at 100% duty then shorten the cycle to exactly one sequence period and report the actual source cycle duration.\n\n"
+            "Duty-cycle %: requested active fraction at the start of each cycle; the remainder is zero. 0% gives silence. Tone and Chirp use round(cycle samples × duty-cycle / 100) active samples. M sequences fit a complete, equal-chip sequence inside the nearest-sample active budget. At 100% duty the cycle is exactly one sequence period, so repeats form a continuous, gap-free loop; below 100% the leftover samples are silent.\n\n"
             "Synthesis FS (Hz): whole-number sample rate used to generate the original cycle. Frequencies must be below synthesis FS / 2. For a DAQ, output FS equals synthesis FS. For speakers, one full cycle is resampled to the selected audio device's native rate BEFORE cycle repetition, plotting, saving, and playback. The cycle length rounds up to a whole output sample, so actual timing can differ slightly from the entered duration.\n\n"
             "Output FS / plotted Nyquist: the prepared buffer's rate is used by all plots, the WAV header, and playback. The PSD and spectrogram extend to OUTPUT FS / 2. For example, synthesis FS = 44000 Hz and speaker output FS = 96000 Hz produce a 48 kHz plotted Nyquist limit, while the source Nyquist limit remains 22 kHz. The timing readout explicitly shows synthesis FS, output FS, and plotted Nyquist.\n\n"
             "Resampling filter: an explicit low-pass FIR with 80 × max(up, down) + 1 taps and a Kaiser window (beta = 10) suppresses interpolation images and filters before downsampling. Its cutoff is half the lower of synthesis FS and output FS; components near that cutoff can be attenuated. This does not undo aliasing already present in the synthesized cycle or eliminate genuine finite-burst and phase-coding sidebands. The full prepared spectrum remains visible for debugging.\n\n"
@@ -235,14 +236,14 @@ class ChirpTransmitApp:
             "Save generated signal to WAV: writes the same prepared float32 buffer used by the previews and playback, including all repeats, duty-cycle silence, and speaker resampling. The WAV header uses the PREPARED OUTPUT rate, which can differ from synthesis FS for speakers. Playback reads this buffer directly; it does not reload the WAV. Choose its path with Browse.\n\n"
             "Start / Stop: Start captures one prepared buffer and its output device. Plots stay tied to that buffer while it is playing, even if signal parameters are edited; the new settings are prepared and shown after playback stops. The lag zoom control still works while playing. Stop interrupts playback. The WAV, when enabled, contains the FULL prepared sequence even if playback is stopped early. Speaker playback explicitly uses the captured audio-device index.\n\n"
             "Previews, left to right: waveform (amplitude versus time, including repeats and silence); time-averaged PSD; spectrogram (frequency versus time); autocorrelation. All four plots use samples from the single prepared output buffer after float32 conversion and speaker resampling. The PSD averages the spectrogram's linear power densities, including silence, before conversion to dB. Segment detrending is disabled: subtracting an unweighted segment mean before Hann windowing can create a spurious near-DC feature. Finite probe duration, gating, and phase coding still produce real spectral spread outside nominal frequencies. These plots describe the intended electrical/digital waveform, not the transducer or speaker response. Preview limit: 2,000,000 prepared output samples. Larger sequences can still be saved/played but display a preview-limit message. Entire sequences are prepared in memory.\n\n"
-            "Autocorrelation: Tone and Chirp show the complete prepared output buffer's aperiodic correlation magnitude, including repeats and silence, normalized to its zero-lag value. M sequences show the circular autocorrelation ENVELOPE of ONE active MLS period extracted from the prepared buffer; configured silence and extra repeats are excluded from this diagnostic. The plot title and vertical-axis label identify the mode. Both use a −100 dB display floor and the same zero-lag zoom. Silent signals are labeled rather than normalized.\n\n"
+            "Autocorrelation: Tone and Chirp show the ENVELOPE of the complete prepared output buffer's aperiodic autocorrelation, including repeats and silence, normalized to its zero-lag value. M sequences show the circular (periodic) autocorrelation ENVELOPE of ONE full prepared cycle, which is what a looped transmission produces; any duty-cycle silence is included, and at 100% duty a dashed line marks the ideal 1/N sidelobe floor. The plot title and vertical-axis label identify the mode. Both use a −100 dB display floor and the same zero-lag zoom. Silent signals are labeled rather than normalized.\n\n"
             "Lag half-width (ms): positive width on EACH side of zero lag in the autocorrelation plot. The default 5 gives a fixed view from −5 to +5 ms. Change it to inspect a narrower central peak or wider sidelobe region. The same range is retained when changing signal type or repeats; this is a display setting and does not change playback or WAV samples. Lags are displayed in milliseconds.\n\n"
             "Edge taper: Tone and Chirp use a Tukey window with alpha = 0.1 to smooth the first and last 5% of their active interval. M sequences have NO burst taper: the first and last chips retain the same source amplitude as all other chips. Speaker resampling still filters transitions and may introduce ringing; it is separate from amplitude tapering."
         )
         descriptions = dict()
         descriptions["Tone"] = "TONE\n\nFundamental frequency (Hz): frequency of a sinusoidal probe.\n\nThe tone occupies the first duty-cycle fraction of T_cycle. For T_cycle = 0.100 s and duty-cycle = 50%, a 0.050 s tapered tone is followed by 0.050 s silence.\n\n"
-        descriptions["Chirp"] = "CHIRP\n\nStart frequency (Hz): frequency at the beginning of the cycle.\n\nStop frequency (Hz): frequency that the sweep would reach at the end of the FULL T_cycle. Both upward and downward sweeps are supported.\n\nDuty-cycle gates the sweep; it does not compress the entire sweep into the active interval. The instantaneous frequency is start + (stop − start) × t / T_cycle.\n\nFor start = 5000 Hz, stop = 4000 Hz, T_cycle = 0.100 s, and duty-cycle = 50%, the active sweep approaches 4500 Hz at 0.050 s, then the remaining 0.050 s is silent. The last active sample is just before that boundary.\n\n"
-        descriptions["M sequences"] = "M SEQUENCES\n\nCarrier frequency (Hz): sinusoid whose sign switches according to a repeatable maximum-length binary sequence. Signs +1 and −1 correspond to carrier phase 0° and 180° (binary phase-shift keying). No whole-burst taper is applied.\n\nSequence order: integer from 2 to 16. The sequence contains N = 2^order − 1 chips. SciPy's default taps and all-ones initial state produce the same code on every cycle.\n\nM-sequence timing: cycle samples = round(FS × T_cycle), active budget = round(cycle samples × duty-cycle / 100), and samples per chip = floor(active budget / N). Every chip has exactly that many synthesis samples, with at least two samples per chip required for a nonzero duty. Actual active samples = N × samples per chip; all remaining cycle samples are silent. Python's nearest-sample round uses ties to even.\n\nFor order 7, synthesis FS = 44000 Hz, T_cycle = 0.100 s, and duty-cycle = 50%, the 2200-sample budget fits 127 chips × 17 samples = 2159 active samples. The active duration is 49.0682 ms, effective source duty is 49.0682%, and chip rate is 44000 / 17 = 2588.24 chips/s. The readout displays actual timing alongside the requested duration and duty.\n\nMain-lobe checks: carrier − actual chip rate must be above 0 Hz, and carrier + actual chip rate must be below min(synthesis FS, output FS) / 2. These checks place the nominal main lobe between DC and both Nyquist limits; rectangular chip transitions still have spectral sidelobes outside that lobe, so these checks do not guarantee zero aliasing.\n\nSource and output timing: chip lengths are equal integers at synthesis FS. Speaker resampling may place chip transitions between native output samples and filters the rectangular transitions; it does not guarantee equal integer output-sample counts per chip. All four previews, the WAV, and playback still use the same final prepared samples.\n\nCircular envelope: the active sample count is mapped to output FS as ceil(source active samples × output FS / synthesis FS). Those samples are sliced directly from the first prepared cycle; the mapped interval can differ by less than one output sample from the source period duration. Compute R = real(ifft(fft(x) × conj(fft(x)))), then the Hilbert envelope abs(hilbert(R)). Normalize the envelope by its zero-lag value, center the lag axis, and plot 20 × log10(normalized envelope). Additional repeats and the duty-cycle pause do not participate. Ringing after the selected interval remains in the waveform/WAV/playback but is excluded from this active-period diagnostic.\n\nThis remains a carrier-modulated, resampled waveform diagnostic, not an ideal binary-code reference. Carrier phase at the period boundary, finite sampling, and filtering can change its shape from the textbook MLS result. No M-sequence burst taper is applied. At 0% duty the output is silent and chip rate is shown as zero. Use the actual saved waveform as the matched-filter template. Physical source/receiver bandwidth further shapes the received signal.\n\n"
+        descriptions["Chirp"] = "CHIRP\n\nStart frequency (Hz): frequency at the beginning of the cycle.\n\nStop frequency (Hz): frequency that the sweep reaches at the end of the ACTIVE pulse. Both upward and downward sweeps are supported.\n\nThe full start-to-stop sweep always fits inside the active interval, so the transmitted bandwidth does not depend on duty-cycle. The instantaneous frequency is start + (stop − start) × t / active duration.\n\nFor start = 5000 Hz, stop = 4000 Hz, T_cycle = 0.100 s, and duty-cycle = 50%, the sweep runs from 5000 Hz to 4000 Hz in 0.050 s, then the remaining 0.050 s is silent.\n\n"
+        descriptions["M sequences"] = "M SEQUENCES\n\nCarrier frequency (Hz): sinusoid whose sign switches according to a repeatable maximum-length binary sequence. Signs +1 and −1 correspond to carrier phase 0° and 180° (binary phase-shift keying). No whole-burst taper is applied.\n\nSequence order: integer from 2 to 16. The sequence contains N = 2^order − 1 chips. SciPy's default taps and all-ones initial state produce the same code on every cycle.\n\nM-sequence timing: cycle samples = round(FS × T_cycle), active budget = round(cycle samples × duty-cycle / 100), and samples per chip = floor(active budget / N), rounded down to a length that holds a WHOLE NUMBER OF CARRIER CYCLES. Every chip has exactly that many synthesis samples, with at least two samples per chip required for a nonzero duty. Whole carrier cycles per chip keep the carrier continuous across chips and across repeated periods, which the ideal periodic autocorrelation requires. Actual active samples = N × samples per chip. At 100% duty the cycle equals the active samples (a continuous loop); otherwise the remaining cycle samples are silent. Python's nearest-sample round uses ties to even.\n\nFor carrier 10000 Hz, order 7, synthesis FS = 44000 Hz, T_cycle = 0.0635 s, and duty-cycle = 100%, a chip must be a multiple of 22 samples (5 carrier cycles). The 2794-sample budget fits 127 chips × 22 samples exactly, giving 2000 chips/s, a main lobe from 8 to 12 kHz, and a 63.5 ms period that loops with no gap. The readout displays actual timing alongside the requested duration and duty.\n\nMain-lobe checks: carrier − actual chip rate must be above 0 Hz, and carrier + actual chip rate must be below min(synthesis FS, output FS) / 2. These checks place the nominal main lobe between DC and both Nyquist limits; rectangular chip transitions still have spectral sidelobes outside that lobe, so these checks do not guarantee zero aliasing.\n\nSource and output timing: chip lengths are equal integers at synthesis FS. Speaker resampling may place chip transitions between native output samples and filters the rectangular transitions; it does not guarantee equal integer output-sample counts per chip. All four previews, the WAV, and playback still use the same final prepared samples.\n\nCircular envelope: one full prepared cycle is used. Compute R = real(ifft(fft(x) × conj(fft(x)))), then the Hilbert envelope abs(hilbert(R)). Normalize the envelope by its zero-lag value, center the lag axis, and plot 20 × log10(normalized envelope). Additional repeats do not participate; duty-cycle silence does. For the textbook result (a single peak one chip wide on a flat floor 1/N below it) use 100% duty and at least two repeats, and process any received period after the first.\n\nThis is a carrier-modulated waveform diagnostic. Speaker resampling and filtering can change its shape from the textbook MLS result; DAQ output is not resampled. No M-sequence burst taper is applied. At 0% duty the output is silent and chip rate is shown as zero. Use the actual saved waveform as the matched-filter template. Physical source/receiver bandwidth further shapes the received signal.\n\n"
         for signal_type in ("Tone", "Chirp", "M sequences"):
             tab = ttk.Frame(notebook)
             notebook.add(tab, text=signal_type)
@@ -344,8 +345,9 @@ class ChirpTransmitApp:
         fs = prepared['fs']
         m_sequence = prepared['m_sequence_timing'] is not None
         if m_sequence:
-            data = prepared['m_sequence_period']
-            self.autocorrelation_axes.set_title("MLS circular envelope")
+            # One full transmitted cycle: this is the periodic autocorrelation a looped transmission really has.
+            data = prepared['cycle']
+            self.autocorrelation_axes.set_title("MLS periodic autocorrelation")
             self.autocorrelation_axes.set_ylabel("Normalized envelope (dB)")
         else:
             data = prepared['data']
@@ -361,12 +363,19 @@ class ChirpTransmitApp:
             normalized_envelope = envelope / envelope[0]
             centered_envelope = np.fft.fftshift(normalized_envelope)
             lags = 1000 * (np.arange(len(correlation)) - len(correlation) // 2) / fs
-            self.autocorrelation_axes.plot(lags, 20 * np.log10(np.maximum(centered_envelope, 1e-5)), label="One active period")
+            self.autocorrelation_axes.plot(lags, 20 * np.log10(np.maximum(centered_envelope, 1e-5)), label="One cycle, looped")
+            if len(analysis_data) == prepared['m_sequence_timing'].get('output_active_samples'):
+                ideal_floor_db = -20 * np.log10(prepared['m_sequence_timing']['chips'])
+                self.autocorrelation_axes.axhline(ideal_floor_db, color="gray", linestyle="--", linewidth=0.8, label=f"Ideal floor {ideal_floor_db:.1f} dB")
         else:
             correlation = correlate(analysis_data, analysis_data, mode="full", method="fft")
             lags = 1000 * (np.arange(len(correlation)) - (len(data) - 1)) / fs
-            normalized_magnitude = np.abs(correlation) / correlation[len(data) - 1]
-            self.autocorrelation_axes.plot(lags, 20 * np.log10(np.maximum(normalized_magnitude, 1e-5)), label="Full signal")
+            # Plot the envelope, not the raw carrier-frequency oscillation, so the pulse-compression shape is visible.
+            envelope = np.abs(hilbert(correlation, N=next_fast_len(2 * len(correlation))))[:len(correlation)]
+            normalized_envelope = envelope / envelope[len(data) - 1]
+            self.autocorrelation_axes.set_title("Autocorrelation envelope")
+            self.autocorrelation_axes.set_ylabel("Normalized envelope (dB)")
+            self.autocorrelation_axes.plot(lags, 20 * np.log10(np.maximum(normalized_envelope, 1e-5)), label="Full signal")
         self.autocorrelation_axes.legend(loc="lower right")
 
     def _browse_wav_path(self):
@@ -418,12 +427,13 @@ class ChirpTransmitApp:
         if signal_type == "M sequences":
             if order < 2 or order > 16:
                 raise ValueError("Sequence order must be an integer from 2 to 16.")
-            n_cycle, active_budget, samples_per_chip, n_active = self._m_sequence_timing(t_cycle, duty_cycle, fs, order)
+            n_cycle, active_budget, samples_per_chip, n_active = self._m_sequence_timing(f0, t_cycle, duty_cycle, fs, order)
             if duty_cycle > 0 and samples_per_chip < 2:
-                raise ValueError("M sequence needs at least two equal synthesis samples per chip; lower order or increase duty-cycle, T_cycle, or synthesis FS.")
+                chip_step = self._m_sequence_chip_step(f0, fs)
+                raise ValueError(f"M sequence needs equal chips of at least two samples that each hold a whole number of carrier cycles. At this carrier and synthesis FS a chip must be a multiple of {chip_step} samples, and {2**order - 1} such chips do not fit in the active interval. Increase T_cycle or duty-cycle, lower the order, or choose a carrier that divides the synthesis FS more evenly.")
         else:
-            n_cycle = int(t_cycle * fs)
-            n_active = int(n_cycle * duty_cycle / 100)
+            n_cycle = int(round(t_cycle * fs))
+            n_active = int(round(n_cycle * duty_cycle / 100))
             if duty_cycle > 0 and n_active < 2:
                 raise ValueError("The active duration must contain at least two samples; increase duty-cycle, T_cycle, or FS.")
         if n_cycle < 2:
@@ -439,12 +449,24 @@ class ChirpTransmitApp:
                 self._check_m_sequence_band(f0, chip_rate, fs, fs)
         return signal_type, f0, f1, t_cycle, duty_cycle, fs, amplitude, repeats, order
 
-    def _m_sequence_timing(self, t_cycle, duty_cycle, fs, order):
+    def _m_sequence_chip_step(self, f0, fs):
+        # Smallest chip length (in samples) that holds a whole number of carrier cycles.
+        if f0 <= 0:
+            return 1
+        return (Fraction(f0).limit_denominator(1000) / Fraction(int(fs))).denominator
+
+    def _m_sequence_timing(self, f0, t_cycle, duty_cycle, fs, order):
         n_cycle = int(round(t_cycle * fs))
         active_budget = int(round(n_cycle * duty_cycle / 100))
         n_chips = 2**order - 1
-        samples_per_chip = active_budget // n_chips
+        # Textbook phase-coded MLS: every chip holds the same whole number of carrier cycles, so the
+        # carrier is continuous from one period to the next and the periodic autocorrelation is ideal.
+        chip_step = self._m_sequence_chip_step(f0, fs)
+        samples_per_chip = (active_budget // n_chips) // chip_step * chip_step
         n_active = n_chips * samples_per_chip
+        if duty_cycle >= 100 and n_active:
+            # Continuous transmission: the cycle is exactly one sequence period, with no silent remainder.
+            n_cycle = n_active
         return n_cycle, active_budget, samples_per_chip, n_active
 
     def _check_m_sequence_band(self, carrier_frequency, chip_rate, source_fs, output_fs):
@@ -456,17 +478,18 @@ class ChirpTransmitApp:
 
     def _make_signal(self, signal_type, f0, f1, t_cycle, duty_cycle, fs, amplitude, order):
         if signal_type == "M sequences":
-            n_cycle, active_budget, samples_per_chip, n_active = self._m_sequence_timing(t_cycle, duty_cycle, fs, order)
+            n_cycle, active_budget, samples_per_chip, n_active = self._m_sequence_timing(f0, t_cycle, duty_cycle, fs, order)
         else:
-            n_cycle = int(t_cycle * fs)
-            n_active = int(n_cycle * duty_cycle / 100)
+            n_cycle = int(round(t_cycle * fs))
+            n_active = int(round(n_cycle * duty_cycle / 100))
         cycle = np.zeros(n_cycle)
         if n_active == 0:
             return cycle
         t = np.arange(n_active) / fs
         if signal_type == "Chirp":
-            # Sweep slope uses the full T_cycle, even when the active interval is shorter.
-            probe = amplitude * np.sin(2 * np.pi * (f0 * t + (f1 - f0) * t**2 / (2 * t_cycle)))
+            # Textbook linear FM pulse: the sweep runs from start to stop frequency across the active pulse.
+            t_active = n_active / fs
+            probe = amplitude * np.sin(2 * np.pi * (f0 * t + (f1 - f0) * t**2 / (2 * t_active)))
         elif signal_type == "Tone":
             probe = amplitude * np.sin(2 * np.pi * f0 * t)
         else:
@@ -504,7 +527,7 @@ class ChirpTransmitApp:
             sd.check_output_settings(device=audio_device, channels=1, dtype="float32", samplerate=output_fs)
         m_sequence_timing = None
         if signal_type == "M sequences":
-            source_cycle_samples, active_budget, samples_per_chip, n_active = self._m_sequence_timing(t_cycle, duty_cycle, source_fs, order)
+            source_cycle_samples, active_budget, samples_per_chip, n_active = self._m_sequence_timing(f0, t_cycle, duty_cycle, source_fs, order)
             n_chips = 2**order - 1
             chip_rate = source_fs / samples_per_chip if n_active else 0
             if n_active:
@@ -517,8 +540,9 @@ class ChirpTransmitApp:
             m_sequence_timing['active_duration'] = n_active / source_fs
             m_sequence_timing['effective_duty'] = 100 * n_active / source_cycle_samples
             m_sequence_timing['chip_rate'] = chip_rate
+            m_sequence_timing['carrier_cycles_per_chip'] = f0 * samples_per_chip / source_fs
         else:
-            source_cycle_samples = int(t_cycle * source_fs)
+            source_cycle_samples = int(round(t_cycle * source_fs))
         key = (device, channel, parameters, output_fs, audio_device, output_name)
         if self.prepared_output is not None and self.prepared_output['key'] == key:
             if self.prepared_output['data'] is not None or not for_playback:
@@ -547,7 +571,7 @@ class ChirpTransmitApp:
         prepared['sequence_info'] = ""
         prepared['m_sequence_timing'] = m_sequence_timing
         if signal_type == "M sequences":
-            prepared['sequence_info'] = f"Source MLS: {n_chips} chips × {samples_per_chip} samples/chip | Chip rate: {chip_rate:.6g} chips/s | Active: {1000 * n_active / source_fs:.6g} ms (requested {1000 * t_cycle * duty_cycle / 100:.6g} ms) | Duty: {m_sequence_timing['effective_duty']:.6g}% (requested {duty_cycle:g}%) | Source cycle: {1000 * source_cycle_samples / source_fs:.6g} ms"
+            prepared['sequence_info'] = f"Source MLS: {n_chips} chips × {samples_per_chip} samples/chip | {m_sequence_timing['carrier_cycles_per_chip']:.6g} carrier cycles/chip | Chip rate: {chip_rate:.6g} chips/s | Active: {1000 * n_active / source_fs:.6g} ms (requested {1000 * t_cycle * duty_cycle / 100:.6g} ms) | Duty: {m_sequence_timing['effective_duty']:.6g}% (requested {duty_cycle:g}%) | Source cycle: {1000 * source_cycle_samples / source_fs:.6g} ms (requested {1000 * t_cycle:.6g} ms)"
         prepared['data'] = None
         prepared['cycle'] = None
         prepared['m_sequence_period'] = None
@@ -617,7 +641,7 @@ class ChirpTransmitApp:
                 with nidaqmx.Task() as ao:
                     ao.ao_channels.add_ao_voltage_chan(f"{prepared['device']}/{prepared['channel']}", min_val=-10.0, max_val=10.0)
                     ao.timing.cfg_samp_clk_timing(fs, sample_mode=AcquisitionType.FINITE, samps_per_chan=len(data))
-                    ao.write(data, auto_start=False)
+                    ao.write(np.asarray(data, dtype=np.float64), auto_start=False)
                     if not stop_event.is_set():
                         ao.start()
                         deadline = time.monotonic() + 10.0 + len(data) / fs
@@ -627,6 +651,10 @@ class ChirpTransmitApp:
                             if stop_event.wait(0.02):
                                 ao.stop()
                                 break
+                # A finished or stopped task holds its last voltage; return the output to 0 V.
+                with nidaqmx.Task() as zero:
+                    zero.ao_channels.add_ao_voltage_chan(f"{prepared['device']}/{prepared['channel']}", min_val=-10.0, max_val=10.0)
+                    zero.write(0.0, auto_start=True)
         except Exception as exc:
             error = str(exc)
         finally:
