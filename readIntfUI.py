@@ -34,6 +34,7 @@ class DAQMonitorApp:
         self.root.geometry("1100x800")
 
         self.channels = ["ai0", "ai1", "ai2", "ai3"]
+        self.device_name = "Dev1"  # USB-6366 default for this UI
         self.queue = queue.Queue()
         self.data_lock = threading.Lock()
         self.running = False

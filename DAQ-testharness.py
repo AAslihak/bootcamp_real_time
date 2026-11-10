@@ -9,8 +9,12 @@ It is intended as a quick hardware check to confirm that each channel is
 working and that the AO output is being seen on the inputs.
 """
 
+import os
+from datetime import datetime
+
 import numpy as np
 import matplotlib.pyplot as plt
+from scipy.io import wavfile
 
 
 DEVICE = "Dev1"
@@ -22,6 +26,40 @@ N_CYCLES = 10          # number of full sine cycles
 DURATION_SEC = N_CYCLES / FREQ_HZ
 AI_RANGE = 2.0         # input range in volts (+/-)
 AO_AMPLITUDE = 1.0     # output amplitude in volts peak
+SAVE_DIR = "daq_recordings"
+
+
+def get_next_recording_prefix(save_dir=SAVE_DIR):
+    """Create an incrementing recording prefix like 'record_0001' for each new run."""
+    os.makedirs(save_dir, exist_ok=True)
+
+    existing = []
+    if os.path.isdir(save_dir):
+        for name in os.listdir(save_dir):
+            if name.startswith("record_") and name.endswith(".wav"):
+                existing.append(name)
+
+    used = set()
+    for name in existing:
+        stem = os.path.splitext(name)[0]
+        if stem.startswith("record_"):
+            try:
+                used.add(int(stem.split("_")[-1]))
+            except ValueError:
+                pass
+
+    idx = 1
+    while idx in used:
+        idx += 1
+    return os.path.join(save_dir, f"record_{idx:04d}")
+
+
+def save_channel_wavs(data, base_prefix):
+    """Write each AI channel to its own WAV file using the same recording prefix."""
+    for idx, name in enumerate(AI_CHANNELS):
+        path = f"{base_prefix}_{name}.wav"
+        wavfile.write(path, int(FS), np.asarray(data[:, idx], dtype=np.float32))
+        print(f"Saved {path}")
 
 
 def make_output_wave(fs, freq_hz, n_cycles, amplitude):
@@ -118,7 +156,12 @@ def plot_channels(data, fs, wave):
 
     fig.suptitle("DAQ test harness: AO0 sine + AI0-AI3 acquisition")
     fig.tight_layout()
-    fig.savefig("DAQ_testharness.png", dpi=150)
+    base_prefix = get_next_recording_prefix()
+    fig.savefig(f"{base_prefix}_summary.png", dpi=150)
+    save_channel_wavs(data, base_prefix)
+    np.savez(f"{base_prefix}_data.npz", t=t_ms / 1000.0, data=data, fs=FS)
+    print(f"Saved summary plot: {base_prefix}_summary.png")
+    print(f"Saved raw data archive: {base_prefix}_data.npz")
     plt.show()
 
 

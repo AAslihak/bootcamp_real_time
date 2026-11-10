@@ -1,0 +1,13 @@
+{
+  "device": "Dev1",
+  "sample_rate_hz": 44000.0,
+  "channels": [
+    "ai0",
+    "ai1",
+    "ai2",
+    "ai3"
+  ],
+  "input_range_v": 5.0,
+  "notes": "DAQ capture notes",
+  "saved_at": "2026-11-09 16:00:47"
+}
