@@ -13,7 +13,6 @@ Features:
 
 import json
 import os
-import queue
 import threading
 import time
 from collections import deque
@@ -27,6 +26,9 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from scipy.io import wavfile
 
 
+MAX_BUFFER_SAMPLES = 8191
+
+
 class DAQMonitorApp:
     def __init__(self, root):
         self.root = root
@@ -34,8 +36,8 @@ class DAQMonitorApp:
         self.root.geometry("1100x800")
 
         self.channels = ["ai0", "ai1", "ai2", "ai3"]
+        self.max_buffer_frames = MAX_BUFFER_SAMPLES // len(self.channels)
         self.device_name = "Dev1"  # USB-6366 default for this UI
-        self.queue = queue.Queue()
         self.data_lock = threading.Lock()
         self.running = False
         self.stop_event = None
@@ -113,17 +115,18 @@ class DAQMonitorApp:
         self.canvas.get_tk_widget().pack(fill="both", expand=True)
 
     def _update_ui(self):
-        while not self.queue.empty():
-            data = self.queue.get()
-            self._append_to_history(data)
+        with self.data_lock:
+            history = self.history.copy()
 
-        if self.running and self.history.size > 0:
-            display_n = min(self.history.shape[0], max(2000, int(float(self.sample_rate_var.get()) * 0.5)))
-            y = self.history[-display_n:]
-            t = np.arange(y.shape[0]) / max(float(self.sample_rate_var.get()), 1e-6)
+        if self.running and history.size > 0:
+            display_n = min(history.shape[0], max(2000, int(float(self.sample_rate_var.get()) * 0.5)))
+            y = history[-display_n:]
+            sample_rate = max(float(self.sample_rate_var.get()), 1e-6)
+            t = np.arange(y.shape[0]) / sample_rate
+            time_window = max(1.0 / sample_rate, y.shape[0] / sample_rate)
             for idx, line in enumerate(self.lines):
                 line.set_data(t, y[:, idx])
-                self.axs[idx].set_xlim(0, max(1.0, t[-1] if t.size else 1.0))
+                self.axs[idx].set_xlim(0, time_window)
                 if y.size:
                     ymin = np.min(y[:, idx])
                     ymax = np.max(y[:, idx])
@@ -137,14 +140,9 @@ class DAQMonitorApp:
         if data.size == 0:
             return
         with self.data_lock:
-            if self.history.shape[0] == 0:
-                self.history = np.asarray(data, dtype=np.float64)
-            else:
-                self.history = np.vstack([self.history, np.asarray(data, dtype=np.float64)])
-
-            max_points = max(1000, int(float(self.sample_rate_var.get()) * 2.0))
-            if self.history.shape[0] > max_points:
-                self.history = self.history[-max_points:]
+            new_data = np.asarray(data, dtype=np.float64).reshape(-1, len(self.channels))
+            combined = np.concatenate((self.history, new_data), axis=0)
+            self.history = combined[-self.max_buffer_frames:]
 
     def _browse_save_dir(self):
         folder = filedialog.askdirectory(initialdir=self.save_dir_var.get() or os.path.abspath("."))
@@ -162,29 +160,36 @@ class DAQMonitorApp:
         os.makedirs(save_dir, exist_ok=True)
 
         fname = self.output_file_var.get().strip() or "daq_capture.wav"
-        if not fname.lower().endswith(".wav"):
-            fname += ".wav"
-        self.log_path = os.path.join(save_dir, fname)
+        base_name = os.path.splitext(fname)[0]
+        if not base_name:
+            base_name = "daq_capture"
 
         data = np.concatenate(self.log_chunks, axis=0)
         if data.shape[1] != len(self.channels):
             data = data.reshape(-1, len(self.channels))
 
         data = np.asarray(data, dtype=np.float32)
-        wavfile.write(self.log_path, int(float(self.sample_rate_var.get())), data)
+        for idx, channel in enumerate(self.channels):
+            channel_path = os.path.join(save_dir, f"{base_name}_{channel}.wav")
+            wavfile.write(
+                channel_path,
+                int(float(self.sample_rate_var.get())),
+                data[:, idx],
+            )
 
-        metadata = {
-            "device": self.device_var.get(),
-            "sample_rate_hz": float(self.sample_rate_var.get()),
-            "channels": self.channels,
-            "input_range_v": float(self.v_range_var.get()),
-            "notes": self.notes_box.get("1.0", "end-1c").strip(),
-            "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        }
+            metadata = {
+                "device": self.device_var.get(),
+                "sample_rate_hz": float(self.sample_rate_var.get()),
+                "channel": channel,
+                "input_range_v": float(self.v_range_var.get()),
+                "notes": self.notes_box.get("1.0", "end-1c").strip(),
+                "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            meta_path = os.path.splitext(channel_path)[0] + ".json"
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(metadata, f, indent=2)
 
-        meta_path = self.log_path.rsplit(".", 1)[0] + ".json"
-        with open(meta_path, "w", encoding="utf-8") as f:
-            json.dump(metadata, f, indent=2)
+        self.log_path = os.path.join(save_dir, base_name)
 
     def _acquire_loop(self):
         try:
@@ -194,7 +199,10 @@ class DAQMonitorApp:
             device = self.device_var.get().strip() or "Dev1"
             sample_rate = float(self.sample_rate_var.get())
             v_range = float(self.v_range_var.get())
-            block_size = max(1024, int(sample_rate * 0.1))
+            block_size = min(
+                max(1024, int(sample_rate * 0.1)),
+                self.max_buffer_frames,
+            )
 
             with nidaqmx.Task() as task:
                 for ch in self.channels:
@@ -224,7 +232,7 @@ class DAQMonitorApp:
                         else:
                             arr = arr.reshape(-1, len(self.channels))
 
-                    self.queue.put(arr)
+                    self._append_to_history(arr)
                     if self.log_enabled_var.get():
                         self.log_chunks.append(arr.copy())
 
