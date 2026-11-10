@@ -40,7 +40,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from scipy import signal
 
 
-APP_TITLE = "NI DAQ Multi-Channel Monitor v3"
+APP_TITLE = "NI DAQ Multi-Channel Monitor v3.1"
 RATE_PRESETS = ["50000", "100000", "200000", "500000", "1000000", "2000000"]
 RANGE_PRESETS = ["0.2", "0.5", "1", "2", "5", "10"]
 TERMINAL_CHOICES = ["DIFF", "PSEUDO_DIFF", "RSE", "NRSE"]
@@ -307,71 +307,122 @@ def stamp_safe(s):
 # ----------------------------------------------------------------------------
 
 class NISource:
+    """NI-DAQmx input task with fallbacks for settings the device or driver rejects."""
+
     def __init__(self, cfg):
         import nidaqmx
         from nidaqmx.constants import AcquisitionType, TerminalConfiguration
-        from nidaqmx.stream_readers import AnalogMultiChannelReader
+        self._nidaqmx = nidaqmx
+        self._AcqType = AcquisitionType
+        self._Term = TerminalConfiguration
+        self.cfg = cfg
+        self.notes = []
+        self.task = None
 
-        dev = cfg["device"]
-        chans = cfg["channels"]
-        nch = len(chans)
-        self.info = ""
+        # try the requested terminal type first, then the device default
+        attempts = [cfg["terminal"]]
+        if cfg["terminal"] != "DEFAULT":
+            attempts.append("DEFAULT")
+        last_exc = None
+        for term_name in attempts:
+            try:
+                self._build(term_name)
+                if term_name != cfg["terminal"]:
+                    self.notes.append(f"terminal {cfg['terminal']} rejected, using DEFAULT")
+                last_exc = None
+                break
+            except Exception as exc:
+                last_exc = exc
+                self._close_task()
+        if last_exc is not None:
+            raise last_exc
 
-        # check the requested rate against the device limit for a clearer error
+        self.info = "; ".join(self.notes)
+
+    def _terminal(self, name):
+        term = getattr(self._Term, name, None)
+        if term is None:  # older nidaqmx names
+            old = {"DIFF": "DIFFERENTIAL", "PSEUDO_DIFF": "PSEUDODIFFERENTIAL"}
+            term = getattr(self._Term, old.get(name, "DEFAULT"), None)
+        return term
+
+    def _build(self, term_name):
+        cfg = self.cfg
+        self.notes = []
+        self.task = self._nidaqmx.Task()
+        term = self._terminal(term_name)
+        for ch in cfg["channels"]:
+            kwargs = dict(min_val=-cfg["v_range"], max_val=cfg["v_range"])
+            if term is not None and term_name != "DEFAULT":
+                kwargs["terminal_config"] = term
+            self.task.ai_channels.add_ai_voltage_chan(f"{cfg['device']}/{ch}", **kwargs)
+
+        # clamp the rate to what this device allows with this many channels
+        rate = float(cfg["rate"])
         try:
-            from nidaqmx.system import Device
-            d = Device(dev)
-            simultaneous = bool(d.ai_simultaneous_sampling_supported)
-            max_rate = d.ai_max_multi_chan_rate if nch > 1 else d.ai_max_single_chan_rate
-            per_ch = max_rate if (simultaneous or nch == 1) else max_rate / nch
-            self.info = f"{d.product_type}, max {per_ch:,.0f} S/s per channel with {nch} ch"
-            if cfg["rate"] > per_ch * 1.0001:
-                raise ValueError(
-                    f"{d.product_type} supports at most {per_ch:,.0f} S/s per channel "
-                    f"with {nch} channels. Lower the sample rate."
-                )
-        except ValueError:
-            raise
+            max_rate = float(self.task.timing.samp_clk_max_rate)
+            if rate > max_rate:
+                self.notes.append(f"requested {rate:,.0f} S/s is above the device limit, using {max_rate:,.0f}")
+                rate = max_rate
         except Exception:
             pass
 
-        term = getattr(TerminalConfiguration, cfg["terminal"], None)
-        if term is None:  # older nidaqmx names
-            old = {"DIFF": "DIFFERENTIAL", "PSEUDO_DIFF": "PSEUDODIFFERENTIAL"}
-            term = getattr(TerminalConfiguration, old.get(cfg["terminal"], "DEFAULT"))
-
-        self.task = nidaqmx.Task()
+        self.task.timing.cfg_samp_clk_timing(
+            rate,
+            sample_mode=self._AcqType.CONTINUOUS,
+            samps_per_chan=max(1000, int(rate * 0.05)),
+        )
         try:
-            for ch in chans:
-                self.task.ai_channels.add_ai_voltage_chan(
-                    f"{dev}/{ch}",
-                    min_val=-cfg["v_range"],
-                    max_val=cfg["v_range"],
-                    terminal_config=term,
-                )
-            block_guess = max(1000, int(cfg["rate"] * 0.05))
-            self.task.timing.cfg_samp_clk_timing(
-                cfg["rate"],
-                sample_mode=AcquisitionType.CONTINUOUS,
-                samps_per_chan=block_guess,
-            )
             self.rate = float(self.task.timing.samp_clk_rate)  # actual (coerced) rate
-            self.block = max(1000, int(self.rate * 0.05))     # read 50 ms per call
-            buf_seconds = 10.0 if self.rate <= 500e3 else 4.0
-            self.task.in_stream.input_buf_size = int(self.rate * buf_seconds)
-            self.buf_frames = int(self.task.in_stream.input_buf_size)
-            self.reader = AnalogMultiChannelReader(self.task.in_stream)
-            self.data = np.zeros((nch, self.block), dtype=np.float64)
         except Exception:
-            self.task.close()
-            raise
+            self.rate = rate
+        self.block = max(1000, int(self.rate * 0.05))  # read 50 ms per call
+
+        buf_seconds = 10.0 if self.rate <= 500e3 else 4.0
+        try:
+            self.task.in_stream.input_buf_size = int(self.rate * buf_seconds)
+        except Exception:
+            self.notes.append("could not enlarge driver buffer")
+        try:
+            self.buf_frames = int(self.task.in_stream.input_buf_size)
+        except Exception:
+            self.buf_frames = int(self.rate * buf_seconds)
+
+        # validate everything now so bad settings fail here, not mid-run
+        try:
+            from nidaqmx.constants import TaskMode
+            self.task.control(TaskMode.TASK_COMMIT)
+        except ImportError:
+            pass
+
+        nch = len(cfg["channels"])
+        self.data = np.zeros((nch, self.block), dtype=np.float64)
+        try:
+            from nidaqmx.stream_readers import AnalogMultiChannelReader
+            self.reader = AnalogMultiChannelReader(self.task.in_stream)
+        except Exception:
+            self.reader = None  # fall back to task.read()
+
+    def _close_task(self):
+        if self.task is not None:
+            try:
+                self.task.close()
+            except Exception:
+                pass
+        self.task = None
 
     def start(self):
         self.task.start()
 
     def read(self):
-        self.reader.read_many_sample(self.data, number_of_samples_per_channel=self.block, timeout=5.0)
-        return self.data.T.astype(np.float32)
+        if self.reader is not None:
+            self.reader.read_many_sample(self.data, number_of_samples_per_channel=self.block, timeout=5.0)
+            return self.data.T.astype(np.float32)
+        raw = np.asarray(self.task.read(number_of_samples_per_channel=self.block, timeout=5.0),
+                         dtype=np.float32)
+        if raw.ndim == 1:
+            raw = raw.reshape(1, -1)
+        return raw.T.copy()
 
     def backlog(self):
         try:
@@ -384,11 +435,12 @@ class NISource:
         self.task.start()
 
     def close(self):
-        try:
-            self.task.stop()
-        except Exception:
-            pass
-        self.task.close()
+        if self.task is not None:
+            try:
+                self.task.stop()
+            except Exception:
+                pass
+        self._close_task()
 
 
 class SimSource:
@@ -401,7 +453,10 @@ class SimSource:
         self.buf_frames = int(self.rate * 10)
         self.n = 0
         self.t0 = None
-        self.rng = np.random.default_rng()
+        try:
+            self.rng = np.random.default_rng()
+        except AttributeError:  # numpy older than 1.17
+            self.rng = np.random.RandomState()
         self.f0, self.f1, self.T, self.period = 3e3, 15e3, 0.1, 0.3
         self.delays = np.arange(self.nch) * 0.5e-3
         self.gains = 0.5 / (1 + 0.3 * np.arange(self.nch))
@@ -434,6 +489,44 @@ class SimSource:
         pass
 
     def close(self):
+        pass
+
+
+DAQ_HINTS = {
+    -50103: "The DAQ is being used by another program. Close any other copy of this script, "
+            "NI MAX test panels, or other scripts using this device. Then press Start.",
+    -200220: "Device not found. Open NI MAX, check the device name (for example Dev1), "
+             "and type it in the Device box.",
+    -201003: "The device is not responding. Check the USB cable and power, then press Start.",
+    -200170: "A channel name is not valid for this device. Check the Channels box (for example ai0:3).",
+    -200077: "A setting is not supported by this device. Try a lower sample rate or "
+             "a different input range.",
+    -200279: "The computer could not keep up with the DAQ. Lower the sample rate or turn off Live plot.",
+}
+
+
+def explain_error(exc):
+    code = getattr(exc, "error_code", None)
+    first = str(exc).strip().splitlines()[0] if str(exc).strip() else type(exc).__name__
+    hint = DAQ_HINTS.get(code)
+    if hint:
+        return f"{hint}\n\n(NI error {code}: {first})"
+    return f"{type(exc).__name__}: {first}"
+
+
+LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "readIntfUI_errors.log")
+
+
+def log_exception(where, exc_info=None):
+    import traceback
+    try:
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(f"\n===== {datetime.now():%Y-%m-%d %H:%M:%S} | {where} =====\n")
+            if exc_info is None:
+                f.write(traceback.format_exc())
+            else:
+                f.write("".join(traceback.format_exception(*exc_info)))
+    except Exception:
         pass
 
 
@@ -484,6 +577,7 @@ class DAQMonitorApp:
         self._build_ui()
         self._init_plot()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.root.report_callback_exception = self._callback_error
         self.root.after(200, self._tick)
 
     # ------------------------------------------------------------------ vars
@@ -545,10 +639,10 @@ class DAQMonitorApp:
         ttk.Combobox(disp, textvariable=self.view_var, values=VIEW_CHOICES, width=11,
                      state="readonly").grid(row=0, column=1, **pad)
         ttk.Label(disp, text="Window (s):").grid(row=0, column=2, sticky="w", **pad)
-        ttk.Spinbox(disp, textvariable=self.window_var, from_=0.01, to=RING_SECONDS, increment=0.1,
+        tk.Spinbox(disp, textvariable=self.window_var, from_=0.01, to=RING_SECONDS, increment=0.1,
                     width=7).grid(row=0, column=3, **pad)
         ttk.Label(disp, text="Refresh (ms):").grid(row=0, column=4, sticky="w", **pad)
-        ttk.Spinbox(disp, textvariable=self.refresh_var, from_=50, to=2000, increment=50,
+        tk.Spinbox(disp, textvariable=self.refresh_var, from_=50, to=2000, increment=50,
                     width=6).grid(row=0, column=5, **pad)
         ttk.Label(disp, text="Y scale:").grid(row=0, column=6, sticky="w", **pad)
         ttk.Combobox(disp, textvariable=self.yscale_var, values=["Auto", "Fixed"], width=6,
@@ -741,7 +835,8 @@ class DAQMonitorApp:
                     self.write_q.put(("data", block))
                 self.backlog_frac = src.backlog()
         except Exception as exc:
-            self.ui_q.put(("error", f"DAQ error: {exc}"))
+            log_exception("acquisition")
+            self.ui_q.put(("error", explain_error(exc)))
         finally:
             if src is not None:
                 try:
@@ -821,6 +916,7 @@ class DAQMonitorApp:
                     rec.flush_headers()  # keeps files readable if the program crashes
                     last_hdr = time.time()
             except Exception as exc:
+                log_exception("recording")
                 self.ui_q.put(("rec_error", f"Recording error: {exc}"))
                 try:
                     if rec is not None:
@@ -865,6 +961,7 @@ class DAQMonitorApp:
                 json.dump(meta, f, indent=2)
             self.ui_q.put(("info", f"Snapshot saved: {os.path.basename(stem)} ({data.shape[0] / rate:.1f} s)"))
         except Exception as exc:
+            log_exception("snapshot")
             self.ui_q.put(("rec_error", f"Snapshot error: {exc}"))
 
     # ------------------------------------------------------------ ui loop
@@ -876,7 +973,10 @@ class DAQMonitorApp:
                 try:
                     self._update_plot()
                 except Exception as exc:  # never let a plotting problem stop the loop
-                    self.status_var.set(f"Plot error: {exc}")
+                    if not getattr(self, "_plot_error_logged", False):
+                        log_exception("plot")
+                        self._plot_error_logged = True
+                    self.status_var.set(f"Plot error (acquisition still running): {exc}")
         refresh = int(self._num(self.refresh_var, 200, lo=50, hi=5000))
         self.root.after(refresh, self._tick)
 
@@ -888,6 +988,7 @@ class DAQMonitorApp:
                 return
             if kind == "started":
                 self.start_info = payload
+                self.rate_var.set(f"{payload['rate']:.0f}")
                 if self.resume_recording:
                     self.resume_recording = False
                     self.start_recording()
@@ -907,8 +1008,8 @@ class DAQMonitorApp:
             elif kind == "error":
                 self.pending_restart = False
                 self.resume_recording = False
-                self.status_var.set("Error: " + payload)
-                messagebox.showerror("DAQ error", payload)
+                self.status_var.set("Error: " + payload.splitlines()[0])
+                messagebox.showerror("DAQ error", payload + f"\n\nFull details: {LOG_PATH}")
             elif kind == "rec_done":
                 self.rec_status_var.set(payload)
             elif kind == "rec_error":
@@ -970,7 +1071,10 @@ class DAQMonitorApp:
             ax.set_xlabel("Time relative to latest sample (s)")
             ax.set_ylabel("Frequency (kHz)")
             self.axes = [ax]
-        self.fig.tight_layout(pad=1.5)
+        try:
+            self.fig.tight_layout(pad=1.5)
+        except Exception:
+            pass
         self.layout_key = (view, tuple(visible))
 
     def _update_levels(self, y):
@@ -1078,6 +1182,10 @@ class DAQMonitorApp:
             ax.set_title(f"{ch}  |  FFT {seg}  |  {fs / seg:.1f} Hz bins")
 
         self.canvas.draw_idle()
+
+    def _callback_error(self, exc_type, exc, tb):
+        log_exception("ui callback", (exc_type, exc, tb))
+        self.status_var.set(f"UI error logged to readIntfUI_errors.log: {exc_type.__name__}: {exc}")
 
     # --------------------------------------------------------------- close
     def _on_close(self):
