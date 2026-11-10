@@ -134,7 +134,7 @@ class DAQMonitorApp:
                     self.axs[idx].set_ylim(ymin - pad, ymax + pad)
             self.canvas.draw_idle()
 
-        self.root.after(50, self._update_ui)
+        self.root.after(200, self._update_ui)
 
     def _append_to_history(self, data):
         if data.size == 0:
@@ -199,10 +199,8 @@ class DAQMonitorApp:
             device = self.device_var.get().strip() or "Dev1"
             sample_rate = float(self.sample_rate_var.get())
             v_range = float(self.v_range_var.get())
-            block_size = min(
-                max(1024, int(sample_rate * 0.1)),
-                self.max_buffer_frames,
-            )
+            # read 0.1 s per call (no longer capped by the plot history length)
+            block_size = max(1024, int(sample_rate * 0.1))
 
             with nidaqmx.Task() as task:
                 for ch in self.channels:
@@ -218,6 +216,9 @@ class DAQMonitorApp:
                     sample_mode=AcquisitionType.CONTINUOUS,
                     samps_per_chan=block_size,
                 )
+                # hold 10 s of data per channel in the driver buffer
+                # so a slow plot redraw cannot overflow it
+                task.in_stream.input_buf_size = int(sample_rate * 10)
                 task.start()
 
                 while not self.stop_event.is_set():
@@ -238,13 +239,17 @@ class DAQMonitorApp:
 
                 task.stop()
 
-            self._save_logged_data()
             self.status_var.set("Stopped")
 
         except Exception as exc:
             self.status_var.set(f"Error: {exc}")
             messagebox.showerror("DAQ Error", str(exc))
         finally:
+            # save whatever was logged, even if acquisition stopped on an error
+            try:
+                self._save_logged_data()
+            except Exception as save_exc:
+                print(f"Save failed: {save_exc}")
             self.running = False
             self.stop_event = None
             self.thread = None
