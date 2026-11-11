@@ -1,5 +1,24 @@
 # Changelog — DAQ GUI
 
+## v3.0-beta.1 — beta (tag `gui-v3.0-beta.1`, branch `gui-v3-beta`)
+
+Files: `6259/daq_gui_v3.py`, `6366/daq_gui_6366_v3.py`. Only run with the
+simulated device so far. The v2 files are unchanged.
+
+- Distance (default 0.30 m): pressure levels are referred back to 1 m
+  assuming spherical spreading, level at 1 m = measured level
+  + 20 log10(Distance / 1 m). Applies to the hydrophone PSD, the spectrogram,
+  the Acoustic level and the alarms; the unit becomes dB re 1 µPa²/Hz @ 1 m.
+  Note: the 156 / 159 dB thresholds are now compared with the 1 m value,
+  which is 10.5 dB lower than the v2 reading at 0.30 m.
+- "Equalise with TVR": inverse filtering of the transmit signal with the
+  projector TVR (`projector_tvr.csv`, built-in copy as fallback), magnitude
+  only, then scaled to Peak. The radiated spectrum becomes flat at the level
+  of the weakest frequency in the band.
+- "Auto-record during transmit" is now labelled "Auto-record".
+- The version is shown in the window title; `distance_m` and `tvr_equalised`
+  are written to the recording info.
+
 ## v2.0 — release (tag `gui-v2.0`, branch `main`)
 
 Files: `6259/daq_gui_v2.py`, `6366/daq_gui_6366.py`.

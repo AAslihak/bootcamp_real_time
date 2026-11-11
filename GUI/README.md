@@ -14,7 +14,8 @@ reference hydrophone on an analog input. One folder per DAQ model.
 
 ```
 python -m pip install -r requirements.txt
-python daq_gui_v2.py
+python daq_gui_v2.py        # release
+python daq_gui_v3.py        # beta
 ```
 
 Without the NI-DAQmx driver or a device the program starts with a simulated
@@ -40,5 +41,8 @@ work, run `python check_daq.py` and report its full output together with
 - `hydrophone_rvr.csv`: receive voltage response of the reference hydrophones
   (dB re 1 V/µPa), used to show the spectrum in pressure units.
 
-The values in this file were read off the calibration plot by eye (about
+- `projector_tvr.csv` (v3): transmitting voltage response of the projector
+  (dB re 1 µPa/V @ 1 m), used by "Equalise with TVR".
+
+The values in these files were read off the calibration plots by eye (about
 ±0.1 dB). Replace them with the exact calibration data.

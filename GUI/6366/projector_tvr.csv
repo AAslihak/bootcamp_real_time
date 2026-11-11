@@ -1,0 +1,32 @@
+# Transmitting voltage response (TVR) of the projector, dB re 1 uPa/V @ 1 m.
+# Used by daq_gui_v3.py and daq_gui_6366_v3.py for "Equalise with TVR"
+# (inverse filtering of the transmit signal). Keep this file next to the programs.
+#
+# NOTE: these numbers were read off the "TVR Curve" plot by eye (about
+# +/-0.1 dB, +/-0.1 kHz). Replace them with the exact calibration data.
+#
+# Format: first column is frequency in kHz, second column is the TVR.
+# Values between the listed frequencies are interpolated linearly; outside
+# them the value of the nearest listed frequency is used.
+freq_kHz,TVR
+3.00,128.30
+3.85,129.60
+4.60,130.55
+5.40,136.30
+6.30,140.95
+7.25,143.75
+7.95,145.20
+8.75,146.35
+10.00,147.40
+10.65,148.45
+11.35,149.10
+12.20,149.15
+13.00,148.65
+14.10,147.90
+14.95,147.10
+15.65,146.05
+16.70,144.95
+17.55,143.85
+18.20,142.70
+19.25,141.35
+20.00,140.40
