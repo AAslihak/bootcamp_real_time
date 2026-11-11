@@ -27,11 +27,12 @@ work, run `python check_daq.py` and report its full output together with
 
 | Version | Status | Where | Tag |
 |---|---|---|---|
-| v2.0 | release | branch `main` | `gui-v2.0` |
+| v2.1 | release | branch `main` | `gui-v2.1` |
+| v2.0 | previous release | — | `gui-v2.0` |
 | v3.0-beta.2 | beta, not yet tested on hardware | branch `gui-v3-beta` | `gui-v3.0-beta.2` |
 
 - `main` only holds released versions. Get a specific release with
-  `git checkout gui-v2.0`.
+  `git checkout gui-v2.1`.
 - New features are developed on a beta branch and merged into `main` when
   they have been tested on the hardware; the merge gets a new `gui-vX.Y` tag.
 - Every change is listed in [CHANGELOG.md](CHANGELOG.md).

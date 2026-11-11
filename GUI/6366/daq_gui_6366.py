@@ -9,6 +9,10 @@ AI : continuously acquires the reference hydrophone, shows voltage vs time
      and spectrum (in volts, or in pressure using a hydrophone sensitivity
      curve from hydrophone_rvr.csv), and can record to txt or wav.
 
+Version 2.1 adds Distance: the hydrophone-to-source distance (default 0.30 m).
+Pressure levels are referred back to 1 m assuming spherical spreading (1/r):
+level at 1 m = measured level + 20 log10(distance / 1 m).
+
 USB-6366 specifics (X series): 2 analog outputs (ao0-ao1), 8 simultaneously
 sampled analog inputs (ai0-ai7) that are differential only (each BNC/terminal
 pair is AI n+ / AI n-), input ranges +/-10, 5, 2, 1 V, up to 2 MS/s per channel.
@@ -48,6 +52,7 @@ except Exception as exc:  # package or driver not installed
     nidaqmx = None
     NIDAQMX_ERROR = exc
 
+VERSION = "2.1"  # shown in the window title; see GUI/CHANGELOG.md
 SIM_NAME = "Simulated (no hardware)"
 AO_VMAX = 10.0  # USB-6366 AO range is +/-10 V
 MAX_AO_SAMPLES = 100_000_000  # whole sequence is written at once (~800 MB cap)
@@ -71,6 +76,9 @@ SPECTRUM_XPAD = 1.03  # the frequency axis runs a little past SPECTRUM_FMAX so i
 PSD_YMIN_DEFAULT, PSD_YMAX_DEFAULT = 60.0, 160.0  # manual y range offered first (dB)
 SL_PERIOD_S = 1.0  # SL (and the frame colour) is updated once per this many seconds
 RVR_FILE = "hydrophone_rvr.csv"  # hydrophone sensitivity curves, next to this file
+DEFAULT_DISTANCE_M = 0.30  # hydrophone-to-source distance when the program starts
+REF_DISTANCE_M = 1.0  # pressure levels are referred to this distance (1/r spreading)
+PRESSURE_UNIT = "dB re 1 µPa²/Hz @ 1 m"
 TX_PSD_SEGMENT_S = 1.0  # segment length of the transmit PSD: 1 s gives 1 Hz resolution
 SPECTRUM_FMAX = 20e3  # spectra are displayed from 0 to this frequency (Hz)
 SPECTRUM_FMIN_LOG = 10.0  # lower edge of the log frequency axis (Hz)
@@ -103,6 +111,11 @@ def load_wav(path):
 def min_gi_samples(n_signal):
     """GI is at least as long as the signal (GI >= 50% of the period)."""
     return int(n_signal)
+
+
+def distance_correction_db(distance_m):
+    """dB added to a level measured at distance_m to refer it to 1 m (1/r spreading)."""
+    return 20.0 * math.log10(distance_m / REF_DISTANCE_M)
 
 
 def build_sequence(wav, fs, peak_v, duration_s, gi_s, repeats):
@@ -595,7 +608,8 @@ class LengthBox(QtCore.QObject):
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("WAV Transmit / Reference Hydrophone (NI USB-6366)")
+        self.setWindowTitle(
+            "WAV Transmit / Reference Hydrophone (NI USB-6366) — v%s" % VERSION)
         self.backend = None
         self.wav = None  # float array of the selected channel
         self.wav_all = None
@@ -825,6 +839,21 @@ class MainWindow(QtWidgets.QMainWindow):
              "(curves come from %s)" % RVR_FILE,
              "Gain of any amplifier between the hydrophone and the DAQ that is not "
              "already included in the sensitivity curve; it is removed from the spectrum")
+        # distance between the hydrophone and the source: levels are referred to 1 m
+        self.sp_dist = W.QDoubleSpinBox()
+        self.sp_dist.setRange(0.01, 10000.0)
+        self.sp_dist.setDecimals(2)
+        self.sp_dist.setSingleStep(0.05)
+        self.sp_dist.setValue(DEFAULT_DISTANCE_M)
+        self.sp_dist.setSuffix(" m")
+        self.sp_dist.valueChanged.connect(self._on_distance_changed)
+        self.lb_dist = W.QLabel()
+        pair(f, 5, "Distance", self.sp_dist, "→ 1 m", self.lb_dist,
+             "Distance between the hydrophone and the source. The pressure spectrum and the\n"
+             "Acoustic level are referred back to 1 m assuming spherical spreading (1/r):\n"
+             "level at 1 m = measured level + 20 log10(Distance / 1 m).\n"
+             "Set 1 m to show the level as measured at the hydrophone.",
+             "Correction applied to the measured level to refer it to 1 m")
         # y range of the hydrophone PSD plot (and colour scale of the spectrogram)
         self.ck_yauto = W.QCheckBox("Auto")
         self.ck_yauto.setChecked(True)
@@ -849,7 +878,7 @@ class MainWindow(QtWidgets.QMainWindow):
         row.addWidget(W.QLabel("to"))
         row.addWidget(self.sp_ymax, 1)
         row.addWidget(self.ck_yauto)
-        full(f, 5, row)
+        full(f, 6, row)
         self.ck_logf = W.QCheckBox("Log freq")
         self.ck_logf.setToolTip("Logarithmic frequency axis for both spectra")
         self.ck_logf.toggled.connect(self._set_log_freq)
@@ -869,7 +898,7 @@ class MainWindow(QtWidgets.QMainWindow):
         row.addWidget(self.ck_logf)
         row.addWidget(self.ck_sg)
         row.addWidget(self.sp_sgspan, 1)
-        full(f, 6, row)
+        full(f, 7, row)
         # FFT length of each spectrogram segment: same kind of input as "FFT length";
         # it can only be changed while the Spectrogram box is ticked
         self.sg_len = LengthBox(SG_NFFT_DEFAULT, SG_NFFT_MAX, self._fft_rate, self)
@@ -886,7 +915,7 @@ class MainWindow(QtWidgets.QMainWindow):
         row.addWidget(lb)
         row.addWidget(self.sp_sgfft, 1)
         row.addWidget(self.cb_sgunit)
-        full(f, 7, row)
+        full(f, 8, row)
         row = W.QHBoxLayout()
         self.btn_rec = W.QPushButton("● Start recording")
         self.btn_rec.clicked.connect(self._toggle_record)
@@ -899,10 +928,10 @@ class MainWindow(QtWidgets.QMainWindow):
         row.addWidget(self.btn_rec, 1)
         row.addWidget(self.cb_fmt)
         row.addWidget(b)
-        full(f, 8, row)
+        full(f, 9, row)
         self.lb_rec = note()
         self._show_save_dir()
-        full(f, 9, self.lb_rec)
+        full(f, 10, self.lb_rec)
         self.ai_widgets = [self.cb_ai, self.cb_term, self.cb_range, self.sp_aifs]
         # --- red alarm log: every SL above the red threshold, newest first ---
         g = W.QGroupBox("Red alarms (Acoustic level ≥ %g dB)" % SL_ALARM_DB)
@@ -915,7 +944,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lw_alarm.setSizePolicy(W.QSizePolicy.Policy.Expanding, W.QSizePolicy.Policy.Ignored)
         self.lw_alarm.setToolTip(
             "One line each time the Acoustic level shown above is in the red range: "
-            "time, level and frequency. Newest at the top.")
+            "time, level (dB re 1 µPa²/Hz @ 1 m) and frequency. Newest at the top.")
         lay.addWidget(self.lw_alarm, 1)
         row = W.QHBoxLayout()
         self.lb_alarm = W.QLabel("0 alarms")
@@ -987,7 +1016,8 @@ class MainWindow(QtWidgets.QMainWindow):
             "background: #101820; color: #ffd166; padding: 5px 8px; border-radius: 3px;")
         self.lb_spl.setToolTip(
             "Acoustic level: the maximum of the hydrophone PSD (the lower-right plot) and the "
-            "frequency where it occurs, in dB re 1 µPa²/Hz with a Sensor selected.\n"
+            "frequency where it occurs, in dB re 1 µPa²/Hz with a Sensor selected,\n"
+            "referred to 1 m from the source (see Distance).\n"
             "It is updated once per second and shows the highest value reached "
             "during the previous second.\n"
             "Frame of the window: none below %g dB, orange from %g dB, red from %g dB "
@@ -1350,7 +1380,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 # V^2/Hz -> µPa^2/Hz: divide by the sensitivity squared, only where calibrated
                 keep = (f >= cal[0][0]) & (f <= cal[0][-1])
                 f = f[keep]
-                db = db[keep] - np.interp(f, cal[0], cal[1]) - self.sp_gain.value()
+                db = (db[keep] - np.interp(f, cal[0], cal[1]) - self.sp_gain.value()
+                      + distance_correction_db(self.sp_dist.value()))  # referred to 1 m
             has_signal = bool(f.size) and bool(np.any(spec))  # all-zero record: nothing to show
             if has_signal:
                 i = int(np.argmax(db))
@@ -1390,7 +1421,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _reset_spectrogram(self, *_):
         """(Re)create the rolling image for the current rate / FFT size / sensor."""
         cal = self.cb_hyd.currentData()
-        unit = "dB re 1 V²/Hz" if cal is None else "dB re 1 µPa²/Hz"
+        unit = "dB re 1 V²/Hz" if cal is None else PRESSURE_UNIT
         self.plot_sg.setTitle("Hydrophone spectrogram" if cal is None
                               else "Hydrophone spectrogram — %s" % self.cb_hyd.currentText())
         self.sg_bar.axis.setLabel("PSD (%s)" % unit)
@@ -1407,7 +1438,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if cal is not None:
             fc = f[:ncol]
             inside = (fc >= cal[0][0]) & (fc <= cal[0][-1])
-            offset = np.where(inside, np.interp(fc, cal[0], cal[1]) + self.sp_gain.value(),
+            offset = np.where(inside, np.interp(fc, cal[0], cal[1]) + self.sp_gain.value()
+                              - distance_correction_db(self.sp_dist.value()),
                               np.inf)  # outside the calibrated band: no data
         self.sg = {
             "hop": hop, "navg": navg, "nfft": nfft, "win": win, "ncol": ncol,
@@ -1452,7 +1484,7 @@ class MainWindow(QtWidgets.QMainWindow):
         """Show SL = the maximum of the hydrophone PSD and the frequency where it occurs."""
         sensor = self.cb_hyd.currentData() is not None
         head = "Acoustic level (%s)" % self.cb_hyd.currentText() if sensor else "Peak (no Sensor)"
-        hint = "" if sensor else "   ·   select a Sensor for Acoustic level in dB re 1 µPa²/Hz"
+        hint = "" if sensor else "   ·   select a Sensor for Acoustic level in " + PRESSURE_UNIT
         if not self.ai_running:
             self.sl_now = self.sl_best = None
         self._set_sl_frame()
@@ -1461,8 +1493,8 @@ class MainWindow(QtWidgets.QMainWindow):
         elif self.sl_now is None:
             now = "now: no signal"
         else:
-            unit = "dB re 1 µPa²/Hz" if sensor else "dB re 1 V²/Hz"
-            now = "now: %.1f %s @ %.0f Hz" % (self.sl_now[0], unit, self.sl_now[1])
+            unit = PRESSURE_UNIT if sensor else "dB re 1 V²/Hz"
+            now = "now: %.1f %s, at %.0f Hz" % (self.sl_now[0], unit, self.sl_now[1])
         self.lb_spl.setText("%s — %s%s" % (head, now, hint))
 
     def _log_alarm(self):
@@ -1471,7 +1503,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 or self.sl_now[0] < SL_ALARM_DB):
             return
         self.n_alarms += 1
-        self.lw_alarm.insertItem(0, "%s   %.1f dB re 1 µPa²/Hz @ %.0f Hz" % (
+        self.lw_alarm.insertItem(0, "%s   %.1f dB re 1 µPa²/Hz @ 1 m, %.0f Hz" % (
             _dt.datetime.now().strftime("%H:%M:%S"), self.sl_now[0], self.sl_now[1]))
         while self.lw_alarm.count() > SL_LOG_MAX:
             self.lw_alarm.takeItem(self.lw_alarm.count() - 1)
@@ -1530,9 +1562,16 @@ class MainWindow(QtWidgets.QMainWindow):
             self.cb_hyd.setCurrentIndex(default)
         self._on_hydrophone_changed()
 
+    def _on_distance_changed(self, *_):
+        self.lb_dist.setText("%+.1f dB" % distance_correction_db(self.sp_dist.value()))
+        self.sl_best = None  # peaks found with the old distance no longer apply
+        self._reset_spectrogram()
+
     def _on_hydrophone_changed(self, *_):
         cal = self.cb_hyd.currentData()
         self.sp_gain.setEnabled(cal is not None)
+        self.sp_dist.setEnabled(cal is not None)
+        self.lb_dist.setText("%+.1f dB" % distance_correction_db(self.sp_dist.value()))
         n, fs = self._record_len(), self._fft_rate()
         fft = "nfft %d = %.4g s, Δf %.3g Hz" % (n, n / fs, fs / n)
         if cal is None:
@@ -1540,7 +1579,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.plot_f.setLabel("left", "PSD (dB re 1 V²/Hz)")
         else:
             self.plot_f.setTitle("Hydrophone PSD — %s, %s" % (self.cb_hyd.currentText(), fft))
-            self.plot_f.setLabel("left", "PSD (dB re 1 µPa²/Hz)")
+            self.plot_f.setLabel("left", "PSD (%s)" % PRESSURE_UNIT)
         self._apply_yrange()
 
     def _apply_yrange(self, *_):
@@ -1593,9 +1632,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if auto and self.tx_info:
             header.append("tx: " + ", ".join(
                 "%s=%s" % kv for kv in self.tx_info.items()))
-        header.append("hydrophone: %s, gain_dB: %.1f (used for the on-screen spectrum only; "
-                      "the recorded data are raw volts)" % (
-                          self.cb_hyd.currentText(), self.sp_gain.value()))
+        header.append("hydrophone: %s, gain_dB: %.1f, distance_m: %.2f (used for the on-screen "
+                      "spectrum only; the recorded data are raw volts)" % (
+                          self.cb_hyd.currentText(), self.sp_gain.value(),
+                          self.sp_dist.value()))
         if fmt == "wav":
             header.append("data: %s, mono 32-bit float, sample value = volts, "
                           "wav header sample rate = %d Hz" % (
