@@ -1,0 +1,32 @@
+# Receive voltage response (RVR) of the reference hydrophones, dB re 1 V/uPa.
+# Used by daq_gui.py and daq_gui_6366.py to convert the hydrophone spectrum
+# from volts to pressure. Keep this file next to the programs.
+#
+# NOTE: these numbers were read off the "RVR Curve" plot by eye (about
+# +/-0.1 dB, +/-0.1 kHz). Replace them with the exact calibration data.
+#
+# Format: first column is frequency in kHz, every other column is one
+# hydrophone. Add a column to add a hydrophone. Values between the listed
+# frequencies are interpolated linearly; outside them nothing is shown.
+freq_kHz,Orca 1,Narwhal 2
+3.00,-185.80,-185.45
+3.85,-184.00,-184.55
+4.60,-183.95,-182.50
+5.40,-186.55,-184.10
+6.30,-186.90,-185.05
+7.25,-186.80,-184.75
+7.95,-185.80,-184.10
+8.75,-185.15,-183.55
+10.00,-185.10,-183.40
+10.65,-185.50,-183.75
+11.35,-185.90,-183.85
+12.20,-185.80,-183.85
+13.00,-185.35,-183.30
+14.10,-184.95,-182.95
+14.95,-184.60,-182.65
+15.65,-184.00,-182.00
+16.70,-183.65,-181.60
+17.55,-183.20,-181.15
+18.20,-182.80,-180.60
+19.25,-182.15,-179.95
+20.00,-182.10,-179.70

@@ -18,7 +18,6 @@ try the interface (simulated AI = the AO signal itself, like a loopback cable).
 
 Run:  python daq_gui_6366.py
 """
-import collections
 import csv
 import datetime as _dt
 import fractions
@@ -33,9 +32,10 @@ import traceback
 
 import numpy as np
 import pyqtgraph as pg
-from pyqtgraph.Qt import QtCore, QtWidgets
+from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
+from scipy import fft as sfft
 from scipy.io import wavfile
-from scipy.signal import resample_poly
+from scipy.signal import resample_poly, welch
 
 try:
     import nidaqmx
@@ -54,7 +54,24 @@ MAX_AO_SAMPLES = 100_000_000  # whole sequence is written at once (~800 MB cap)
 TICK_MS = 50
 ERROR_LOG = "daq_gui_error.log"  # full error details are appended here, next to this file
 DEFAULT_SENSOR = "Orca 1"  # hydrophone selected when the program starts
+# Level alarm on "SL" = the maximum of the hydrophone PSD (dB re 1 µPa²/Hz):
+# below SL_WARN_DB nothing happens, from SL_WARN_DB up to (not including)
+# SL_ALARM_DB the window gets an orange frame, at SL_ALARM_DB and above a red one.
+SL_WARN_DB = 156.0
+SL_ALARM_DB = 159.0
+SL_WARN_COLOR = "#ff9500"
+SL_ALARM_COLOR = "#ff2d2d"
+SL_FRAME_PX = 8
+SL_LOG_MAX = 1000  # entries kept in the red-alarm list
+NFFT_DEFAULT = 131072  # FFT length of the hydrophone PSD when the program starts (points)
+NFFT_MAX = 4194304  # longest FFT accepted (2^22 points)
+SG_NFFT_DEFAULT = 8192  # FFT length of each spectrogram segment at start (points)
+SG_NFFT_MAX = 65536  # longest spectrogram segment accepted
+SPECTRUM_XPAD = 1.03  # the frequency axis runs a little past SPECTRUM_FMAX so its label shows
+PSD_YMIN_DEFAULT, PSD_YMAX_DEFAULT = 60.0, 160.0  # manual y range offered first (dB)
+SL_PERIOD_S = 1.0  # SL (and the frame colour) is updated once per this many seconds
 RVR_FILE = "hydrophone_rvr.csv"  # hydrophone sensitivity curves, next to this file
+TX_PSD_SEGMENT_S = 1.0  # segment length of the transmit PSD: 1 s gives 1 Hz resolution
 SPECTRUM_FMAX = 20e3  # spectra are displayed from 0 to this frequency (Hz)
 SPECTRUM_FMIN_LOG = 10.0  # lower edge of the log frequency axis (Hz)
 SPECTROGRAM_MIN_DT = 0.02  # smallest time step between spectrogram rows (s)
@@ -424,24 +441,43 @@ def load_rvr(path):
 # --------------------------------------------------------------------------
 # GUI
 # --------------------------------------------------------------------------
-def fourier_spectrum(x, fs):
-    """Amplitude spectrum of a time record by direct Fourier transform.
+def power_spectral_density(x, fs, nseg, nfft=None, hann=True):
+    """One-sided power spectral density (V^2/Hz) by Welch's method.
 
-    S(f) = integral s(t) exp(-i 2 pi f t) dt  ~=  dt * FFT(s)
-    (transform pair as in Jensen et al., Computational Ocean Acoustics; their
-    exp(+i w t) sign convention gives the same magnitude). No segmenting, no
-    window, no averaging, no mean removal. Returns (f, |S(f)| in V/Hz) for
-    0 <= f <= fs/2; zero-padded to a power of two, which only interpolates.
+    The record is cut into segments of nseg samples with 50% overlap; each
+    periodogram is 2 |FFT(w x)|^2 / (fs sum(w^2)) and the segments are averaged.
+    w is a Hann window, or all ones (no window) when hann is False.
+    A record shorter than nseg is treated as one segment.
+    nfft (>= segment length) zero-pads each segment, which sets the spacing of
+    the frequency points to fs / nfft. The mean is not removed. Integrating
+    the result over frequency gives the mean-square voltage. Returns (f, psd).
     """
-    nfft = 1 << max(1, int(np.ceil(np.log2(x.size))))
-    spec = np.abs(np.fft.rfft(x, nfft)) / fs
-    return np.fft.rfftfreq(nfft, 1.0 / fs), spec
+    nseg = int(min(nseg, x.size))
+    nfft = None if nfft is None else int(max(nfft, nseg))
+    # np.hanning: the same window the spectrogram rows use
+    window = np.hanning(nseg) if hann else np.ones(nseg)
+    return welch(x, fs=fs, window=window, noverlap=nseg // 2, nfft=nfft,
+                 detrend=False, scaling="density")
 
 
-def spectrum_db(spec):
-    """dB re 1 V/Hz with a 160 dB display floor below the peak."""
-    peak = float(spec.max()) if spec.size else 0.0
-    return 20 * np.log10(np.maximum(spec, max(peak * 1e-8, 1e-300)))
+def record_psd(x, fs, win, win_power):
+    """One-sided PSD (V^2/Hz) of one whole record: a single Hann-windowed periodogram.
+
+    psd = 2 |FFT(win * x)|^2 / (fs * sum(win^2)); the 0 Hz and Nyquist bins are
+    not doubled. Frequency resolution is fs / len(x), i.e. 1 / record duration.
+    Returns (f, psd).
+    """
+    psd = np.abs(sfft.rfft(x * win)) ** 2 * (2.0 / (fs * win_power))
+    psd[0] *= 0.5
+    if x.size % 2 == 0:
+        psd[-1] *= 0.5
+    return sfft.rfftfreq(x.size, 1.0 / fs), psd
+
+
+def psd_db(psd):
+    """10 log10 of a PSD, with a 160 dB display floor below the peak."""
+    peak = float(psd.max()) if psd.size else 0.0
+    return 10 * np.log10(np.maximum(psd, max(peak * 1e-16, 1e-300)))
 
 
 def minmax_decimate(t0, dt, y, n_points=PLOT_POINTS):
@@ -457,6 +493,103 @@ def minmax_decimate(t0, dt, y, n_points=PLOT_POINTS):
     out[1::2] = blocks.max(axis=1)
     tb = t0 + dt * ((n - m) + step * np.arange(blocks.shape[0]))
     return np.repeat(tb, 2), out
+
+
+class FrameWidget(QtWidgets.QWidget):
+    """Central widget that can draw a coloured frame around the whole window.
+
+    The frame is painted directly. (A style sheet would also work, but changing
+    a style sheet makes Qt re-style every child and lose the smaller font of
+    the control column.)
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._color = None
+
+    def set_frame(self, color):
+        """color: e.g. "#ff2d2d", or None for no frame."""
+        if color != self._color:
+            self._color = color
+            self.update()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if self._color is None:
+            return
+        painter = QtGui.QPainter(self)
+        pen = QtGui.QPen(QtGui.QColor(self._color))
+        pen.setWidth(SL_FRAME_PX)
+        pen.setJoinStyle(QtCore.Qt.PenJoinStyle.MiterJoin)
+        painter.setPen(pen)
+        half = SL_FRAME_PX / 2.0
+        painter.drawRect(QtCore.QRectF(self.rect()).adjusted(half, half, -half, -half))
+        painter.end()
+
+
+class LengthBox(QtCore.QObject):
+    """An FFT length entered either as a number of points ("nfft") or in seconds.
+
+    `spin` and `unit` are the two widgets; `points()` is the length in samples.
+    Switching the unit converts the number so that the length stays the same.
+    """
+
+    changed = QtCore.Signal()
+
+    def __init__(self, default_points, max_points, rate_fn, parent=None):
+        super().__init__(parent)
+        self._rate = rate_fn  # callable returning the sample rate used for conversion
+        self._max = int(max_points)
+        self._unit = "nfft"
+        self.spin = QtWidgets.QDoubleSpinBox()
+        self.unit = QtWidgets.QComboBox()
+        self.unit.addItems(["nfft", "s"])  # nfft is the default unit
+        self._configure(default_points)
+        self.spin.valueChanged.connect(lambda *_: self.changed.emit())
+        self.unit.currentTextChanged.connect(self._on_unit)
+
+    def _configure(self, value):
+        self.spin.blockSignals(True)
+        if self._unit == "nfft":
+            self.spin.setDecimals(0)
+            self.spin.setRange(16, self._max)
+            self.spin.setSingleStep(1024)
+        else:
+            self.spin.setDecimals(4)
+            self.spin.setRange(0.0001, 60.0)
+            self.spin.setSingleStep(0.1)
+        self.spin.setValue(value)
+        self.spin.blockSignals(False)
+
+    def _on_unit(self, unit):
+        if unit == self._unit:
+            return
+        fs = self._rate()
+        value = self.spin.value() / fs if unit == "s" else round(self.spin.value() * fs)
+        self._unit = unit
+        self._configure(value)
+        self.changed.emit()
+
+    def points(self):
+        if self._unit == "nfft":
+            n = int(round(self.spin.value()))  # exactly what was entered
+        else:
+            n = int(round(self.spin.value() * self._rate()))
+            n = sfft.next_fast_len(max(n, 16), real=True)  # a nearby length the FFT handles quickly
+        return int(min(max(n, 16), self._max))
+
+    def set_seconds(self, seconds):
+        """Switch the unit to seconds and set the length."""
+        self._unit = "s"
+        self.unit.blockSignals(True)
+        self.unit.setCurrentText("s")
+        self.unit.blockSignals(False)
+        self._configure(seconds)
+        self.changed.emit()
+
+    def set_enabled(self, on):
+        self.spin.setEnabled(on)
+        self.unit.setEnabled(on)
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -491,9 +624,17 @@ class MainWindow(QtWidgets.QMainWindow):
     # ---------------- UI ----------------
     def _build_ui(self):
         W = QtWidgets
-        central = W.QWidget()
+        central = FrameWidget()
+        self.central = central
+        self._psd_win = None  # cached Hann window for the current record length
+        self._psd_next = 0.0  # earliest time for the next hydrophone PSD
+        self.sl_now = None  # displayed SL: (peak of the hydrophone PSD in dB, its frequency in Hz)
+        self.sl_best = None  # highest PSD peak seen so far in the current SL period
+        self.sl_t0 = 0.0  # start of the current SL period
+        self.sl_state = None
         self.setCentralWidget(central)
         root = W.QHBoxLayout(central)
+        root.setContentsMargins(SL_FRAME_PX + 4, SL_FRAME_PX + 4, SL_FRAME_PX + 4, SL_FRAME_PX + 4)
         left = W.QVBoxLayout()
         panel = W.QWidget()
         small = panel.font()  # compact control column: slightly smaller text
@@ -646,24 +787,29 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sp_aifs.setSingleStep(10000)
         self.sp_aifs.setValue(100000)
         pair(f, 1, "Range", self.cb_range, "Rate (Hz)", self.sp_aifs,
-             "Input range", "Sample rate")
+             "Input range: the largest voltage the input can measure. Pick the smallest "
+             "range that still covers the signal; anything beyond it is clipped",
+             "Sample rate you request; after Start monitoring it shows the rate the "
+             "device actually uses")
         self.btn_mon = W.QPushButton("Start monitoring")
         self.btn_mon.clicked.connect(self._toggle_monitor)
         full(f, 2, self.btn_mon)
-        self.sp_win = W.QDoubleSpinBox()
-        self.sp_win.setRange(0.01, 10.0)
-        self.sp_win.setDecimals(2)
-        self.sp_win.setValue(2.0)
-        self.sp_win.setSuffix(" s")
-        self.sp_win.valueChanged.connect(self._resize_ring)
-        self.cb_nfft = W.QComboBox()
-        for n in (1024, 2048, 4096, 8192, 16384, 32768, 65536):
-            self.cb_nfft.addItem(str(n), n)
-        self.cb_nfft.setCurrentIndex(3)
-        self.cb_nfft.currentIndexChanged.connect(self._resize_ring)
-        pair(f, 3, "Window", self.sp_win, "FFT", self.cb_nfft,
-             "Length of the time plot",
-             "Number of most recent samples transformed for the hydrophone spectrum")
+        # FFT length of the hydrophone PSD (= length of the time plot), entered
+        # either as a number of points (nfft) or in seconds
+        self.fft_len = LengthBox(NFFT_DEFAULT, NFFT_MAX, self._fft_rate, self)
+        self.sp_win, self.cb_winunit = self.fft_len.spin, self.fft_len.unit
+        self.fft_len.changed.connect(self._resize_ring)
+        tip = ("FFT length of the hydrophone PSD; the time plot shows exactly this record.\n"
+               "nfft: number of points.  s: seconds (points = seconds x Rate).\n"
+               "Frequency resolution = Rate / nfft = 1 / seconds.")
+        lb = W.QLabel("FFT length")
+        for wdg in (lb, self.sp_win, self.cb_winunit):
+            wdg.setToolTip(tip)
+        row = W.QHBoxLayout()
+        row.addWidget(lb)
+        row.addWidget(self.sp_win, 1)
+        row.addWidget(self.cb_winunit)
+        full(f, 3, row)
         self.cb_hyd = W.QComboBox()
         self.cb_hyd.addItem("None (V)", None)
         self.cb_hyd.currentIndexChanged.connect(self._on_hydrophone_changed)
@@ -679,12 +825,37 @@ class MainWindow(QtWidgets.QMainWindow):
              "(curves come from %s)" % RVR_FILE,
              "Gain of any amplifier between the hydrophone and the DAQ that is not "
              "already included in the sensitivity curve; it is removed from the spectrum")
+        # y range of the hydrophone PSD plot (and colour scale of the spectrogram)
+        self.ck_yauto = W.QCheckBox("Auto")
+        self.ck_yauto.setChecked(True)
+        self.sp_ymin = W.QDoubleSpinBox()
+        self.sp_ymax = W.QDoubleSpinBox()
+        for sp, val in ((self.sp_ymin, PSD_YMIN_DEFAULT), (self.sp_ymax, PSD_YMAX_DEFAULT)):
+            sp.setRange(-400.0, 400.0)
+            sp.setDecimals(0)
+            sp.setSingleStep(5.0)
+            sp.setValue(val)
+            sp.setEnabled(False)
+            sp.valueChanged.connect(self._apply_yrange)
+        self.ck_yauto.toggled.connect(self._apply_yrange)
+        tip = ("Vertical range of the hydrophone PSD plot in dB (also the colour scale of the "
+               "spectrogram).\nAuto: fit the data. Untick to enter the minimum and maximum.")
+        lb = W.QLabel("PSD y")
+        for wdg in (lb, self.sp_ymin, self.sp_ymax, self.ck_yauto):
+            wdg.setToolTip(tip)
+        row = W.QHBoxLayout()
+        row.addWidget(lb)
+        row.addWidget(self.sp_ymin, 1)
+        row.addWidget(W.QLabel("to"))
+        row.addWidget(self.sp_ymax, 1)
+        row.addWidget(self.ck_yauto)
+        full(f, 5, row)
         self.ck_logf = W.QCheckBox("Log freq")
         self.ck_logf.setToolTip("Logarithmic frequency axis for both spectra")
         self.ck_logf.toggled.connect(self._set_log_freq)
         self.ck_sg = W.QCheckBox("Spectrogram")
         self.ck_sg.setToolTip(
-            "Show the hydrophone spectrum over time instead of the single spectrum:\n"
+            "Show the hydrophone PSD over time instead of the single PSD:\n"
             "x = frequency, y = time (now at the top), colour = level")
         self.ck_sg.toggled.connect(self._set_spectrogram_view)
         self.sp_sgspan = W.QDoubleSpinBox()
@@ -699,6 +870,23 @@ class MainWindow(QtWidgets.QMainWindow):
         row.addWidget(self.ck_sg)
         row.addWidget(self.sp_sgspan, 1)
         full(f, 6, row)
+        # FFT length of each spectrogram segment: same kind of input as "FFT length";
+        # it can only be changed while the Spectrogram box is ticked
+        self.sg_len = LengthBox(SG_NFFT_DEFAULT, SG_NFFT_MAX, self._fft_rate, self)
+        self.sp_sgfft, self.cb_sgunit = self.sg_len.spin, self.sg_len.unit
+        self.sg_len.changed.connect(self._resize_ring)
+        self.sg_len.set_enabled(False)
+        tip = ("FFT length of each spectrogram segment, in points (nfft) or seconds.\n"
+               "Can be changed only while 'Spectrogram' is ticked.\n"
+               "Shorter = finer time resolution, longer = finer frequency resolution.")
+        lb = W.QLabel("Sg FFT")
+        for wdg in (lb, self.sp_sgfft, self.cb_sgunit):
+            wdg.setToolTip(tip)
+        row = W.QHBoxLayout()
+        row.addWidget(lb)
+        row.addWidget(self.sp_sgfft, 1)
+        row.addWidget(self.cb_sgunit)
+        full(f, 7, row)
         row = W.QHBoxLayout()
         self.btn_rec = W.QPushButton("● Start recording")
         self.btn_rec.clicked.connect(self._toggle_record)
@@ -711,12 +899,33 @@ class MainWindow(QtWidgets.QMainWindow):
         row.addWidget(self.btn_rec, 1)
         row.addWidget(self.cb_fmt)
         row.addWidget(b)
-        full(f, 7, row)
+        full(f, 8, row)
         self.lb_rec = note()
         self._show_save_dir()
-        full(f, 8, self.lb_rec)
+        full(f, 9, self.lb_rec)
         self.ai_widgets = [self.cb_ai, self.cb_term, self.cb_range, self.sp_aifs]
-        left.addStretch(1)
+        # --- red alarm log: every SL above the red threshold, newest first ---
+        g = W.QGroupBox("Red alarms (Acoustic level ≥ %g dB)" % SL_ALARM_DB)
+        lay = W.QVBoxLayout(g)
+        lay.setContentsMargins(6, 3, 6, 3)
+        lay.setSpacing(3)
+        self.lw_alarm = W.QListWidget()
+        self.lw_alarm.setMinimumHeight(2 * line + 6)
+        # take whatever height is left in the column instead of asking for more
+        self.lw_alarm.setSizePolicy(W.QSizePolicy.Policy.Expanding, W.QSizePolicy.Policy.Ignored)
+        self.lw_alarm.setToolTip(
+            "One line each time the Acoustic level shown above is in the red range: "
+            "time, level and frequency. Newest at the top.")
+        lay.addWidget(self.lw_alarm, 1)
+        row = W.QHBoxLayout()
+        self.lb_alarm = W.QLabel("0 alarms")
+        b = W.QPushButton("Clear")
+        b.clicked.connect(self._clear_alarms)
+        row.addWidget(self.lb_alarm, 1)
+        row.addWidget(b)
+        lay.addLayout(row)
+        left.addWidget(g, 1)
+        self.n_alarms = 0
         # let inputs shrink so two fit per row inside the fixed-width column
         for cb in panel.findChildren(W.QComboBox):
             cb.setSizeAdjustPolicy(
@@ -741,19 +950,19 @@ class MainWindow(QtWidgets.QMainWindow):
             plots.addWidget(pw, 2 * row, col)  # grid row 1 holds the level readout
             return pw, pw.plot(pen=pg.mkPen(color, width=1))
 
-        psd = "|S(f)| (dB re 1 V/Hz)"
+        psd = "PSD (dB re 1 V²/Hz)"
         self.plot_txt, self.curve_txt = make_plot(
             TX_TITLE, "time", "s", "voltage", "V", "#3aa655", 0, 0)
         self.gi_region = pg.LinearRegionItem(movable=False, brush=(255, 255, 255, 30))
         self.gi_region.setVisible(False)
         self.plot_txt.addItem(self.gi_region)
         self.plot_txf, self.curve_txf = make_plot(
-            "Transmit signal — spectrum", "frequency", "Hz", psd, None, "#c9a227", 0, 1)
+            "Transmit signal — PSD", "frequency", "Hz", psd, None, "#c9a227", 0, 1)
         self.plot_t, self.curve_t = make_plot(
             "Reference hydrophone — voltage vs time", "time", "s", "voltage", "V",
             "#2a78d6", 1, 0)
         self.plot_f, self.curve_f = make_plot(
-            "Reference hydrophone — spectrum", "frequency", "Hz", psd, None, "#d6542a", 1, 1)
+            "Hydrophone PSD", "frequency", "Hz", psd, None, "#d6542a", 1, 1)
         # the hydrophone spectrum shares its cell with the spectrogram view
         plots.removeWidget(self.plot_f)
         self.sg_stack = W.QStackedWidget()
@@ -768,7 +977,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sg_bar.setImageItem(self.sg_img, insert_in=self.plot_sg.getPlotItem())
         self.sg_stack.addWidget(self.plot_sg)
         plots.addWidget(self.sg_stack, 2, 1)
-        # received level (SPL) readout: a strip between the two rows of plots
+        # SL read-out: a strip between the two rows of plots
         self.lb_spl = W.QLabel()
         font = self.lb_spl.font()
         font.setBold(True)
@@ -777,28 +986,31 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lb_spl.setStyleSheet(
             "background: #101820; color: #ffd166; padding: 5px 8px; border-radius: 3px;")
         self.lb_spl.setToolTip(
-            "Received level, independent of the FFT size.\n"
-            "With a Sensor: sound pressure level (SPL) in dB re 1 µPa rms over the "
-            "calibrated band, using the sensitivity curve at every frequency.\n"
-            "Without a Sensor: voltage level in dB re 1 V rms (all frequencies above 0 Hz).\n"
-            "'now' is the most recent FFT-size block; 'last transmit' is the highest "
-            "level averaged over one transmit duration.")
+            "Acoustic level: the maximum of the hydrophone PSD (the lower-right plot) and the "
+            "frequency where it occurs, in dB re 1 µPa²/Hz with a Sensor selected.\n"
+            "It is updated once per second and shows the highest value reached "
+            "during the previous second.\n"
+            "Frame of the window: none below %g dB, orange from %g dB, red from %g dB "
+            "(only with a Sensor selected)." % (
+                SL_WARN_DB, SL_WARN_DB, SL_ALARM_DB))
         self.lb_spl.setWordWrap(True)  # wrap instead of forcing the window wider
         plots.addWidget(self.lb_spl, 1, 0, 1, 2)
         plots.setRowStretch(0, 1)
         plots.setRowStretch(2, 1)
         self.sg = None  # spectrogram state, created when monitoring starts
-        self.lv = None  # received-level state, created when monitoring starts
         self._set_log_freq(False)  # fix the frequency axis to 0..SPECTRUM_FMAX
         self._load_hydrophones()
         self._draw_level()  # show the readout strip (with its hint) from the start
+        # keep the "nfft = seconds, Δf" note in the PSD title up to date
+        self.fft_len.changed.connect(self._on_hydrophone_changed)
+        self.sp_aifs.valueChanged.connect(self._on_hydrophone_changed)
         # wide window: use most of the screen width (the plots take the extra room)
-        width, height = 1500, 760
+        width, height = 1500, 860
         screen = QtWidgets.QApplication.primaryScreen()
         if screen is not None:
             avail = screen.availableGeometry()
             width = max(1150, min(1800, int(avail.width() * 0.96)))
-            height = min(height, avail.height() - 40)
+            height = min(height, avail.height() - 30)
         self.resize(width, height)
 
     # ---------------- device ----------------
@@ -864,7 +1076,21 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cb_wavch.addItems(["ch %d" % (i + 1) for i in range(data.shape[1])])
         self.cb_wavch.blockSignals(False)
         self.wav = data[:, 0]
-        self.sp_dur.setValue(max(self.sp_dur.minimum(), data.shape[0] / fs))
+        wav_len = data.shape[0] / fs
+        self.sp_dur.setValue(max(self.sp_dur.minimum(), wav_len))
+        # guard interval: defaults to the WAV length and can never be shorter than it
+        self._on_duration_changed(self.sp_dur.value())
+        self.sp_gi.setValue(wav_len)
+        # hydrophone sample rate: defaults to twice the WAV sample rate
+        if self.ai_running:
+            self.statusBar().showMessage(
+                "Rate left at %.0f Hz: stop monitoring to change it (2 x WAV rate = %.0f Hz)"
+                % (self.ai_fs, 2.0 * fs))
+        else:
+            self.sp_aifs.setValue(2.0 * fs)  # limited to the device maximum by the box itself
+        # FFT length of the hydrophone PSD: defaults to the length of the transmitted
+        # signal, in seconds so that it does not depend on the sample rate
+        self.fft_len.set_seconds(self.sp_dur.value())
         self._update_tx_info()
 
     def _on_wav_channel(self, i):
@@ -873,8 +1099,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self._update_tx_info()  # refreshes the peak read-out and the preview
 
     def _on_duration_changed(self, dur):
-        # GI minimum = transmit duration; it may be longer, never shorter
-        self.sp_gi.setMinimum(dur)
+        # GI minimum = transmit duration (at least 50% of each period is silence),
+        # and never less than the WAV length; it may be longer, never shorter
+        wav_len = self.wav_all.shape[0] / self.wav_fs if self.wav_all is not None else 0.0
+        self.sp_gi.setMinimum(max(dur, wav_len))
         self._update_tx_info()
 
     def _update_tx_info(self, *_):
@@ -919,16 +1147,30 @@ class MainWindow(QtWidgets.QMainWindow):
             self.plot_txt.setTitle(TX_TITLE)
         self.gi_region.setVisible(not truncated)
         self.curve_txt.setData(t, y)
-        f, spec = fourier_spectrum(shot, fs)  # one transform of the whole shot
-        self.curve_txf.setData(*minmax_decimate(f[1], f[1], spectrum_db(spec[1:])))
+        # Welch PSD of the whole shot with 1 Hz frequency resolution: segments of
+        # 1 second (fs points), 50% overlap, NO window (a window would taper the two
+        # ends of a short pulse, i.e. the two ends of the band of a swept signal).
+        # A shot shorter than 1 s is a single segment, zero-padded to fs points so
+        # the points are still 1 Hz apart.
+        nseg = int(round(fs * TX_PSD_SEGMENT_S))
+        f, spec = power_spectral_density(shot, fs, nseg, nfft=nseg, hann=False)
+        self.curve_txf.setData(*minmax_decimate(f[1], f[1], psd_db(spec[1:])))
 
     def _set_log_freq(self, on):
         for pw in (self.plot_f, self.plot_txf):
             pw.setLogMode(x=on, y=False)
-            if on:  # in log mode the view range is in log10(Hz)
-                pw.setXRange(np.log10(SPECTRUM_FMIN_LOG), np.log10(SPECTRUM_FMAX), padding=0)
-            else:
-                pw.setXRange(0, SPECTRUM_FMAX, padding=0)
+            self._style_freq_axis(pw, on)
+
+    @staticmethod
+    def _style_freq_axis(pw, log=False, fmax=SPECTRUM_FMAX):
+        """0..fmax with a label every 2 kHz, drawn slightly past fmax so its label is visible."""
+        axis = pw.getAxis("bottom")
+        if log:  # in log mode the view range is in log10(Hz)
+            axis.setTickSpacing()
+            pw.setXRange(np.log10(SPECTRUM_FMIN_LOG), np.log10(fmax * SPECTRUM_XPAD), padding=0)
+        else:
+            axis.setTickSpacing(major=2000.0, minor=1000.0)
+            pw.setXRange(0, fmax * SPECTRUM_XPAD, padding=0)
 
     # ---------------- transmit ----------------
     def _start_tx(self):
@@ -967,7 +1209,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tx_info.update(fs=actual, period=(n_sig + n_gi) / actual,
                             sig=n_sig / actual, total=seq.size / actual)
         self.tx_active = True
-        self._begin_shot_level(self.tx_info["sig"])
         for w in self.tx_widgets:
             w.setEnabled(False)
         self.btn_tx.setEnabled(False)
@@ -998,8 +1239,6 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self.tx_active:
             return
         self.tx_active = False
-        if self.lv is not None and self.lv["blocks"] is not None:
-            self.lv["tail"] = self.lv["blocks"].maxlen  # catch a shot still in the buffer
         try:
             self.backend.stop_ao()
         except Exception as exc:
@@ -1032,6 +1271,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self._error("AI failed to start", exc)
             return False
         self.ai_running = True
+        # the device may adjust the requested rate slightly: show what it really uses
+        self.sp_aifs.blockSignals(True)
+        self.sp_aifs.setValue(self.ai_fs)
+        self.sp_aifs.blockSignals(False)
+        self.statusBar().showMessage("Actual AI sample rate %.3f Hz" % self.ai_fs)
+        self.sl_now = self.sl_best = None
+        self.sl_t0 = time.perf_counter()
         self._resize_ring()
         for w in self.ai_widgets:
             w.setEnabled(False)
@@ -1044,6 +1290,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.recorder is not None:
             self._stop_record()
         self.ai_running = False
+        self._draw_level()  # clears the SL read-out and the coloured frame
         try:
             self.backend.stop_ai()
         except Exception as exc:
@@ -1055,14 +1302,14 @@ class MainWindow(QtWidgets.QMainWindow):
     def _resize_ring(self, *_):
         if not self.ai_running:
             return
-        # must hold the time plot, one FFT and one spectrogram row, plus half a
+        # must hold the FFT record and one spectrogram row, plus half a
         # second so spectrogram rows can be taken slightly in the past
-        nfft = self.cb_nfft.currentData()
-        n = max(int(self.sp_win.value() * self.ai_fs), nfft,
-                nfft * self._spectrogram_step()[1])
+        nfft = self.sg_len.points()
+        n = max(self._record_len(), nfft, nfft * self._spectrogram_step()[1])
         self.ring = np.zeros(n + int(0.5 * self.ai_fs))
         self.ring_fill = 0
         self._reset_spectrogram()
+        self._on_hydrophone_changed()  # title shows the FFT length in points and seconds
 
     def _push(self, x):
         n = self.ring.size
@@ -1073,42 +1320,69 @@ class MainWindow(QtWidgets.QMainWindow):
             self.ring[n - x.size :] = x
         self.ring_fill = min(n, self.ring_fill + x.size)
 
+    def _fft_rate(self):
+        """Sample rate used to convert between points and seconds."""
+        return self.ai_fs if self.ai_running else self.sp_aifs.value()
+
+    def _record_len(self):
+        """Points in the FFT of the hydrophone PSD; the time plot shows the same record."""
+        return self.fft_len.points()
+
     def _update_plots(self):
         if self.ring_fill < 2:
             return
         fs = self.ai_fs
-        n_win = min(self.ring_fill, max(2, int(self.sp_win.value() * fs)))
+        n_rec = self._record_len()
+        n_win = min(self.ring_fill, n_rec)
         y = self.ring[-n_win:]
         t, yd = minmax_decimate(-n_win / fs, 1.0 / fs, y)
         self.curve_t.setData(t, yd)
-        nfft = self.cb_nfft.currentData()
-        if self.ck_sg.isChecked():
-            self._draw_spectrogram()
-        elif self.ring_fill >= nfft:
-            # one transform of the most recent nfft samples
-            f, spec = fourier_spectrum(self.ring[-nfft:], fs)
-            df, f, db = f[1], f[1:], spectrum_db(spec[1:])
+        now = time.perf_counter()
+        if self.ring_fill >= n_rec and now >= self._psd_next:
+            # PSD of exactly the record shown in the time plot (one FFT of FFT-length points)
+            if self._psd_win is None or self._psd_win[0].size != n_rec:
+                win = np.hanning(n_rec)
+                self._psd_win = (win, float(np.sum(win ** 2)))
+            f, spec = record_psd(self.ring[-n_rec:], fs, *self._psd_win)
+            df, f, db = f[1], f[1:], psd_db(spec[1:])
             cal = self.cb_hyd.currentData()
             if cal is not None:
-                # volts -> pressure: |P(f)| = |S(f)| / sensitivity, only where calibrated
+                # V^2/Hz -> µPa^2/Hz: divide by the sensitivity squared, only where calibrated
                 keep = (f >= cal[0][0]) & (f <= cal[0][-1])
                 f = f[keep]
                 db = db[keep] - np.interp(f, cal[0], cal[1]) - self.sp_gain.value()
-            if f.size and np.any(spec):  # an all-zero block has no spectrum to draw
-                self.curve_f.setData(*minmax_decimate(f[0], df, db))
-            else:
-                self.curve_f.setData([], [])
+            has_signal = bool(f.size) and bool(np.any(spec))  # all-zero record: nothing to show
+            if has_signal:
+                i = int(np.argmax(db))
+                if self.sl_best is None or db[i] > self.sl_best[0]:
+                    self.sl_best = (float(db[i]), float(f[i]))  # highest peak this period
+            if not self.ck_sg.isChecked():
+                if has_signal:
+                    self.curve_f.setData(*minmax_decimate(f[0], df, db))
+                else:
+                    self.curve_f.setData([], [])
+            # a long FFT takes a while: leave time for the rest of the program
+            spent = time.perf_counter() - now
+            self._psd_next = time.perf_counter() + 2.0 * spent
+        if self.ck_sg.isChecked():
+            self._draw_spectrogram()
+        # once per SL_PERIOD_S: publish the highest PSD peak of the period as SL
+        if time.perf_counter() - self.sl_t0 >= SL_PERIOD_S:
+            self.sl_now, self.sl_best = self.sl_best, None
+            self.sl_t0 = time.perf_counter()
+            self._log_alarm()
 
     # ---------------- spectrogram ----------------
     def _set_spectrogram_view(self, on):
         self.sg_stack.setCurrentIndex(1 if on else 0)
         self.ck_logf.setEnabled(not on)  # the image uses a linear frequency axis
+        self.sg_len.set_enabled(on)  # the spectrogram FFT can only be changed while it is shown
         if on and self.sg is not None:
             self.sg["dirty"] = True
 
     def _spectrogram_step(self):
         """(samples between rows, FFT segments averaged per row)."""
-        fs, nfft = self.ai_fs, self.cb_nfft.currentData()
+        fs, nfft = self.ai_fs, self.sg_len.points()
         dt = max(SPECTROGRAM_MIN_DT, self.sp_sgspan.value() / SPECTROGRAM_MAX_ROWS)
         hop = max(nfft // 2, int(fs * dt))
         return hop, max(1, hop // nfft)
@@ -1120,10 +1394,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.plot_sg.setTitle("Hydrophone spectrogram" if cal is None
                               else "Hydrophone spectrogram — %s" % self.cb_hyd.currentText())
         self.sg_bar.axis.setLabel("PSD (%s)" % unit)
-        self._reset_level()
+        self._draw_level()
         if not self.ai_running:
             return
-        fs, nfft = self.ai_fs, self.cb_nfft.currentData()
+        fs, nfft = self.ai_fs, self.sg_len.points()
         hop, navg = self._spectrogram_step()
         f = np.fft.rfftfreq(nfft, 1.0 / fs)
         ncol = max(2, int(np.searchsorted(f, SPECTRUM_FMAX, side="right")))
@@ -1146,7 +1420,7 @@ class MainWindow(QtWidgets.QMainWindow):
         span = nrow * hop / fs
         self.sg_img.setImage(self.sg["img"], autoLevels=False)
         self.sg_img.setRect(QtCore.QRectF(0.0, -span, ncol * f[1], span))
-        self.plot_sg.setXRange(0, min(SPECTRUM_FMAX, ncol * f[1]), padding=0)
+        self._style_freq_axis(self.plot_sg, False, min(SPECTRUM_FMAX, ncol * f[1]))
         self.plot_sg.setYRange(-span, 0, padding=0)
 
     def _feed_spectrogram(self, n_new):
@@ -1173,87 +1447,54 @@ class MainWindow(QtWidgets.QMainWindow):
             img[-1] = np.maximum(row, SPECTROGRAM_FLOOR)
             sg["dirty"] = True
 
-    # ---------------- received level (SPL) ----------------
-    def _reset_level(self):
-        """(Re)create the level meter for the current rate / FFT size / sensor."""
-        self.lv = None
-        if not self.ai_running:
-            self._draw_level()
-            return
-        fs, nfft = self.ai_fs, self.cb_nfft.currentData()
-        f = np.fft.rfftfreq(nfft, 1.0 / fs)
-        cal = self.cb_hyd.currentData()
-        if cal is None:
-            weight = np.ones(f.size)
-            weight[0] = 0.0  # ignore the DC offset
-            name, unit = "Level", "re 1 V"
-        else:
-            inside = (f >= cal[0][0]) & (f <= cal[0][-1])
-            # sensitivity in V per µPa at every bin (curve plus external gain)
-            sens = 10 ** ((np.interp(f, cal[0], cal[1]) + self.sp_gain.value()) / 20)
-            weight = np.where(inside, 1.0 / sens ** 2, 0.0)
-            name = "SPL"
-            unit = "re 1 µPa, %.0f–%.0f kHz" % (cal[0][0] / 1e3, cal[0][-1] / 1e3)
-        # Parseval: mean square of a block = (2 / N^2) * sum over positive bins |X_k|^2
-        weight = weight * 2.0 / nfft ** 2
-        if nfft % 2 == 0:
-            weight[-1] /= 2.0  # the Nyquist bin is not doubled
-        self.lv = {"nfft": nfft, "weight": weight, "block_s": nfft / fs, "pending": 0,
-                   "name": name, "unit": unit, "now": None,
-                   "blocks": None, "tail": None, "shot_e": None, "shot_dur": None}
-        self._draw_level()
-
-    def _begin_shot_level(self, duration_s):
-        """Start looking for the highest level averaged over one transmit duration."""
-        lv = self.lv
-        if lv is None:
-            return
-        # enough whole blocks to be sure one complete shot fits inside
-        n = int(math.ceil(duration_s / lv["block_s"])) + 1
-        lv.update(blocks=collections.deque(maxlen=n), tail=None, shot_e=0.0,
-                  shot_dur=duration_s)
-
-    def _feed_level(self, n_new):
-        lv = self.lv
-        if lv is None:
-            return
-        lv["pending"] += n_new
-        nfft, size = lv["nfft"], self.ring.size
-        while lv["pending"] >= nfft:
-            end = size - (lv["pending"] - nfft)
-            lv["pending"] -= nfft
-            start = end - nfft
-            if start < size - self.ring_fill or start < 0:
-                continue
-            mean_square = float(np.sum(
-                lv["weight"] * np.abs(np.fft.rfft(self.ring[start:end])) ** 2))
-            lv["now"] = mean_square
-            if lv["blocks"] is not None:
-                lv["blocks"].append(mean_square * lv["block_s"])  # energy of this block
-                lv["shot_e"] = max(lv["shot_e"], sum(lv["blocks"]))
-                if lv["tail"] is not None:  # transmit finished: a few more blocks, then stop
-                    lv["tail"] -= 1
-                    if lv["tail"] <= 0:
-                        lv["blocks"] = None
-
+    # ---------------- SL read-out ----------------
     def _draw_level(self):
-        lv = self.lv
+        """Show SL = the maximum of the hydrophone PSD and the frequency where it occurs."""
         sensor = self.cb_hyd.currentData() is not None
-        head = "SPL (%s)" % self.cb_hyd.currentText() if sensor else "Received level"
-        hint = "" if sensor else "   ·   select a Sensor for SPL in dB re 1 µPa"
-        if lv is None:
-            self.lb_spl.setText("%s — press Start monitoring%s" % (head, hint))
-            return
-
-        def db(v):
-            return "%.1f dB" % (10 * np.log10(v)) if v and v > 0 else "no signal"
-
-        if lv["shot_dur"] is None:
-            shot = "—"
+        head = "Acoustic level (%s)" % self.cb_hyd.currentText() if sensor else "Peak (no Sensor)"
+        hint = "" if sensor else "   ·   select a Sensor for Acoustic level in dB re 1 µPa²/Hz"
+        if not self.ai_running:
+            self.sl_now = self.sl_best = None
+        self._set_sl_frame()
+        if not self.ai_running:
+            now = "press Start monitoring"
+        elif self.sl_now is None:
+            now = "now: no signal"
         else:
-            shot = "%s (%.3f s avg)" % (db(lv["shot_e"] / lv["shot_dur"]), lv["shot_dur"])
-        self.lb_spl.setText("%s — now: %s  ·  last transmit: %s  [%s]%s" % (
-            head, db(lv["now"]), shot, lv["unit"], hint))
+            unit = "dB re 1 µPa²/Hz" if sensor else "dB re 1 V²/Hz"
+            now = "now: %.1f %s @ %.0f Hz" % (self.sl_now[0], unit, self.sl_now[1])
+        self.lb_spl.setText("%s — %s%s" % (head, now, hint))
+
+    def _log_alarm(self):
+        """Add the newly published SL to the list if it is in the red range."""
+        if (self.sl_now is None or self.cb_hyd.currentData() is None
+                or self.sl_now[0] < SL_ALARM_DB):
+            return
+        self.n_alarms += 1
+        self.lw_alarm.insertItem(0, "%s   %.1f dB re 1 µPa²/Hz @ %.0f Hz" % (
+            _dt.datetime.now().strftime("%H:%M:%S"), self.sl_now[0], self.sl_now[1]))
+        while self.lw_alarm.count() > SL_LOG_MAX:
+            self.lw_alarm.takeItem(self.lw_alarm.count() - 1)
+        self.lb_alarm.setText("%d alarm%s" % (self.n_alarms, "" if self.n_alarms == 1 else "s"))
+
+    def _clear_alarms(self):
+        self.lw_alarm.clear()
+        self.n_alarms = 0
+        self.lb_alarm.setText("0 alarms")
+
+    def _set_sl_frame(self):
+        """Colour the outer frame of the window according to the current SL."""
+        state = None
+        if self.sl_now is not None and self.cb_hyd.currentData() is not None:
+            level = self.sl_now[0]
+            if level >= SL_ALARM_DB:
+                state = SL_ALARM_COLOR
+            elif level >= SL_WARN_DB:
+                state = SL_WARN_COLOR
+        if state == self.sl_state:
+            return
+        self.sl_state = state
+        self.central.set_frame(state)
 
     def _draw_spectrogram(self):
         sg = self.sg
@@ -1262,7 +1503,10 @@ class MainWindow(QtWidgets.QMainWindow):
         sg["dirty"] = False
         top = float(sg["img"].max())
         self.sg_img.setImage(sg["img"], autoLevels=False)
-        if top > SPECTROGRAM_FLOOR:
+        lo, hi = self.sp_ymin.value(), self.sp_ymax.value()
+        if not self.ck_yauto.isChecked() and hi > lo:
+            self.sg_bar.setLevels((lo, hi))
+        elif top > SPECTROGRAM_FLOOR:
             self.sg_bar.setLevels((top - SPECTROGRAM_DYN_DB, top))
 
     def _load_hydrophones(self):
@@ -1289,14 +1533,28 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_hydrophone_changed(self, *_):
         cal = self.cb_hyd.currentData()
         self.sp_gain.setEnabled(cal is not None)
+        n, fs = self._record_len(), self._fft_rate()
+        fft = "nfft %d = %.4g s, Δf %.3g Hz" % (n, n / fs, fs / n)
         if cal is None:
-            self.plot_f.setTitle("Reference hydrophone — spectrum")
-            self.plot_f.setLabel("left", "|S(f)| (dB re 1 V/Hz)")
+            self.plot_f.setTitle("Hydrophone PSD — %s" % fft)
+            self.plot_f.setLabel("left", "PSD (dB re 1 V²/Hz)")
         else:
-            self.plot_f.setTitle("Hydrophone spectrum — %s (%.0f–%.0f kHz)" % (
-                self.cb_hyd.currentText(), cal[0][0] / 1e3, cal[0][-1] / 1e3))
-            self.plot_f.setLabel("left", "|P(f)| (dB re 1 µPa/Hz)")
-        self.plot_f.enableAutoRange(axis="y")
+            self.plot_f.setTitle("Hydrophone PSD — %s, %s" % (self.cb_hyd.currentText(), fft))
+            self.plot_f.setLabel("left", "PSD (dB re 1 µPa²/Hz)")
+        self._apply_yrange()
+
+    def _apply_yrange(self, *_):
+        """Automatic or user-set vertical range of the hydrophone PSD (and spectrogram colours)."""
+        auto = self.ck_yauto.isChecked()
+        self.sp_ymin.setEnabled(not auto)
+        self.sp_ymax.setEnabled(not auto)
+        lo, hi = self.sp_ymin.value(), self.sp_ymax.value()
+        if auto or hi <= lo:
+            self.plot_f.enableAutoRange(axis="y")
+        else:
+            self.plot_f.setYRange(lo, hi, padding=0)
+        if self.sg is not None:
+            self.sg["dirty"] = True  # redraw the spectrogram with the new colour scale
 
     # ---------------- recording ----------------
     def _choose_dir(self):
@@ -1353,7 +1611,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.rec_auto = auto
         self.btn_rec.setText("■ Stop recording")
         self.cb_fmt.setEnabled(False)
-        self.btn_rec.setStyleSheet("color: #c0392b; font-weight: bold;")
         return True
 
     def _stop_record(self):
@@ -1363,7 +1620,6 @@ class MainWindow(QtWidgets.QMainWindow):
         rec.close()
         self.btn_rec.setText("● Start recording")
         self.cb_fmt.setEnabled(True)
-        self.btn_rec.setStyleSheet("")
         self.lb_rec.setText("Saved: %s\n%d samples, %.2f s" % (
             os.path.basename(rec.path), rec.n_samples, rec.n_samples / self.ai_fs))
         self.lb_rec.setToolTip(rec.path)
@@ -1382,7 +1638,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 if x.size:
                     self._push(x)
                     self._feed_spectrogram(x.size)
-                    self._feed_level(x.size)
                     if self.recorder is not None:
                         self.recorder.put(x)
                         self.lb_rec.setText("Recording: %s — %.1f s" % (
