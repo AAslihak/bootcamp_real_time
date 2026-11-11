@@ -1,0 +1,7 @@
+# reference hydrophone recording
+# start_time: 2026-11-10T16:46:20.836
+# fs_Hz: 110497.237569
+# device: Dev3 (USB-6259)
+# ai_channel: ai1, terminal: DIFF, range: ±10 V
+# hydrophone: None (V), gain_dB: 0.0 (used for the on-screen spectrum only; the recorded data are raw volts)
+# data: hydrophone_20261110_164620.wav, mono 32-bit float, sample value = volts, wav header sample rate = 110497 Hz
