@@ -1,0 +1,7 @@
+# reference hydrophone recording
+# start_time: 2026-11-11T08:45:59.156
+# fs_Hz: 96153.846154
+# device: Dev3 (USB-6259)
+# ai_channel: ai0, terminal: RSE, range: ±10 V
+# hydrophone: Orca 1, gain_dB: 0.0 (used for the on-screen spectrum only; the recorded data are raw volts)
+# data: hydrophone_20261111_084559.wav, mono 32-bit float, sample value = volts, wav header sample rate = 96154 Hz
