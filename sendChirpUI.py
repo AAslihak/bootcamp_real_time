@@ -14,13 +14,17 @@ Features:
 import threading
 import re
 import time
+from io import BytesIO
+from datetime import datetime
 from fractions import Fraction
+from pathlib import Path
 import tkinter as tk
 from tkinter import font as tkfont
 from tkinter import ttk, messagebox, filedialog
 
 import numpy as np
 from matplotlib.figure import Figure
+from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from scipy.signal import spectrogram, resample_poly, max_len_seq, correlate, firwin, hilbert
 from scipy.fft import next_fast_len
@@ -28,6 +32,7 @@ from scipy.signal.windows import tukey
 
 
 SPEAKER_DEVICE = "default (laptop speaker)"
+DEFAULT_HYPOTHETICAL_FS = 2_000_000
 
 
 class ChirpTransmitApp:
@@ -42,6 +47,7 @@ class ChirpTransmitApp:
         self.stop_event = None
         self.prepared_output = None
         self.active_output = None
+        self.hypothetical_output = None
 
         self.available_devices = self._discover_devices()
         default_device = self.available_devices[0]
@@ -61,7 +67,13 @@ class ChirpTransmitApp:
         self.repeats_var = tk.StringVar(value="1")
         self.output_info_var = tk.StringVar()
         self.lag_half_width_var = tk.StringVar(value="5")
-        self.save_wav_var = tk.BooleanVar(value=False)
+        self.hypothetical_preview_var = tk.BooleanVar(value=False)
+        self.hypothetical_fs_var = tk.StringVar(value=str(DEFAULT_HYPOTHETICAL_FS))
+        self.plot_duration_ms_var = tk.DoubleVar(value=1.0)
+        self.plot_start_ms_var = tk.DoubleVar(value=0.0)
+        self.plot_window_info_var = tk.StringVar()
+        self.plot_control_key = None
+        self.adjusting_plot_controls = False
         self.wav_path_var = tk.StringVar(value="chirp.wav")
         self.status_var = tk.StringVar(value="Idle")
 
@@ -70,7 +82,7 @@ class ChirpTransmitApp:
         self._build_ui()
         self._on_device_change()
         self._on_signal_change()
-        for variable in (self.f0_var, self.f1_var, self.t_cycle_var, self.duty_cycle_var, self.order_var, self.fs_var, self.amplitude_var, self.repeats_var, self.lag_half_width_var):
+        for variable in (self.f0_var, self.f1_var, self.t_cycle_var, self.duty_cycle_var, self.order_var, self.fs_var, self.amplitude_var, self.repeats_var, self.lag_half_width_var, self.hypothetical_fs_var):
             variable.trace_add("write", self._schedule_preview)
         self._update_preview()
 
@@ -134,8 +146,24 @@ class ChirpTransmitApp:
         self.psd_axes = self.preview_figure.add_subplot(142)
         self.preview_axes = self.preview_figure.add_subplot(143)
         self.autocorrelation_axes = self.preview_figure.add_subplot(144)
+        plot_controls = ttk.Frame(self.preview_frame, width=200)
+        plot_controls.pack(side="left", fill="y", padx=(0, 8))
+        plot_controls.pack_propagate(False)
+        ttk.Label(plot_controls, text="Plot time window", font=("TkDefaultFont", 10, "bold")).pack(anchor="w", pady=(4, 12))
+        ttk.Checkbutton(plot_controls, text="Hypothetical preview", variable=self.hypothetical_preview_var, command=self._on_hypothetical_change).pack(anchor="w", pady=(0, 4))
+        ttk.Label(plot_controls, text="Hypothetical FS (Hz)").pack(anchor="w")
+        self.hypothetical_fs_entry = ttk.Entry(plot_controls, textvariable=self.hypothetical_fs_var, state="disabled", width=18)
+        self.hypothetical_fs_entry.pack(fill="x", pady=(0, 8))
+        ttk.Label(plot_controls, text="Unchecked: exact output", wraplength=190).pack(anchor="w", pady=(0, 12))
+        ttk.Label(plot_controls, text="Duration (ms)").pack(anchor="w")
+        self.plot_duration_scale = tk.Scale(plot_controls, variable=self.plot_duration_ms_var, from_=1, to=1, resolution=-1, showvalue=False, orient="horizontal", command=self._on_plot_control_change)
+        self.plot_duration_scale.pack(fill="x")
+        ttk.Label(plot_controls, text="Start (ms)").pack(anchor="w", pady=(12, 0))
+        self.plot_start_scale = tk.Scale(plot_controls, variable=self.plot_start_ms_var, from_=0, to=0, resolution=-1, showvalue=False, orient="horizontal", command=self._on_plot_control_change)
+        self.plot_start_scale.pack(fill="x")
+        ttk.Label(plot_controls, textvariable=self.plot_window_info_var, wraplength=190).pack(anchor="w", pady=(12, 0))
         self.preview_canvas = FigureCanvasTkAgg(self.preview_figure, master=self.preview_frame)
-        self.preview_canvas.get_tk_widget().pack(fill="both", expand=True)
+        self.preview_canvas.get_tk_widget().pack(side="left", fill="both", expand=True)
         self.preview_colorbar = None
 
         parameters = ttk.Frame(main)
@@ -177,10 +205,10 @@ class ChirpTransmitApp:
         output = ttk.Frame(main)
         output.grid(row=6, column=0, columnspan=3, sticky="ew")
         output.columnconfigure(1, weight=1)
-        ttk.Checkbutton(output, text="Save generated signal to WAV", variable=self.save_wav_var).grid(row=0, column=0, columnspan=3, sticky="w", padx=5, pady=4)
-        ttk.Label(output, text="WAV file:").grid(row=1, column=0, sticky="w", padx=5, pady=4)
-        ttk.Entry(output, textvariable=self.wav_path_var).grid(row=1, column=1, sticky="ew", padx=5, pady=4)
-        ttk.Button(output, text="Browse...", command=self._browse_wav_path).grid(row=1, column=2, padx=5, pady=4)
+        ttk.Label(output, text="WAV file:").grid(row=0, column=0, sticky="w", padx=5, pady=4)
+        ttk.Entry(output, textvariable=self.wav_path_var).grid(row=0, column=1, sticky="ew", padx=5, pady=4)
+        ttk.Button(output, text="Browse...", command=self._browse_wav_path).grid(row=0, column=2, padx=5, pady=4)
+        ttk.Button(output, text="Save WAV + TXT + PNG", command=self.save_output).grid(row=0, column=3, padx=5, pady=4)
         button_row = ttk.Frame(main)
         button_row.grid(row=7, column=0, columnspan=3, pady=6, sticky="ew")
         button_row.columnconfigure(0, weight=1)
@@ -211,6 +239,45 @@ class ChirpTransmitApp:
             self.root.after_cancel(self.preview_after_id)
         self.preview_after_id = self.root.after(250, self._update_preview)
 
+    def _on_plot_control_change(self, value):
+        if not self.adjusting_plot_controls:
+            self._schedule_preview()
+
+    def _on_hypothetical_change(self):
+        self.hypothetical_fs_entry.config(state="normal" if self.hypothetical_preview_var.get() else "disabled")
+        self._schedule_preview()
+
+    def _plot_window_samples(self, prepared):
+        total_samples = prepared['total_samples']
+        fs = prepared['fs']
+        total_ms = 1000 * total_samples / fs
+        min_duration_ms = min(1.0, total_ms)
+        key = (total_samples, fs)
+        self.adjusting_plot_controls = True
+        try:
+            new_signal_duration = self.plot_control_key != key
+            if new_signal_duration:
+                self.plot_duration_scale.configure(from_=min_duration_ms, to=total_ms)
+            if new_signal_duration:
+                self.plot_control_key = key
+                self.plot_duration_ms_var.set(total_ms)
+                self.plot_start_ms_var.set(0.0)
+            duration_ms = min(total_ms, max(min_duration_ms, self.plot_duration_ms_var.get()))
+            if self.plot_duration_ms_var.get() != duration_ms:
+                self.plot_duration_ms_var.set(duration_ms)
+            max_start_ms = max(0.0, total_ms - duration_ms)
+            self.plot_start_scale.configure(from_=0, to=max_start_ms)
+            start_ms = min(max_start_ms, max(0.0, self.plot_start_ms_var.get()))
+            if self.plot_start_ms_var.get() != start_ms:
+                self.plot_start_ms_var.set(start_ms)
+        finally:
+            self.adjusting_plot_controls = False
+        window_samples = min(total_samples, max(2, int(round(duration_ms * fs / 1000))))
+        start_sample = min(total_samples - window_samples, max(0, int(round(start_ms * fs / 1000))))
+        end_sample = start_sample + window_samples
+        self.plot_window_info_var.set(f"Showing {start_sample / fs:.4g}–{end_sample / fs:.4g} s of {total_ms / 1000:.4g} s")
+        return start_sample, end_sample
+
     def _show_help(self):
         if self.help_window is not None and self.help_window.winfo_exists():
             self.help_window.lift()
@@ -227,23 +294,25 @@ class ChirpTransmitApp:
             "Signal type: selects Tone, Chirp, or M sequences and shows only the relevant fields.\n\n"
             "T_cycle (s): length of one complete probe-plus-silence cycle. Repeats includes both portions. All signal types use nearest-sample rounding, round(FS × T_cycle). M sequences at 100% duty then shorten the cycle to exactly one sequence period and report the actual source cycle duration.\n\n"
             "Duty-cycle %: requested active fraction at the start of each cycle; the remainder is zero. 0% gives silence. Tone and Chirp use round(cycle samples × duty-cycle / 100) active samples. M sequences fit a complete, equal-chip sequence inside the nearest-sample active budget. At 100% duty the cycle is exactly one sequence period, so repeats form a continuous, gap-free loop; below 100% the leftover samples are silent.\n\n"
-            "Synthesis FS (Hz): whole-number sample rate used to generate the original cycle. Frequencies must be below synthesis FS / 2. For a DAQ, output FS equals synthesis FS. For speakers, one full cycle is resampled to the selected audio device's native rate BEFORE cycle repetition, plotting, saving, and playback. The cycle length rounds up to a whole output sample, so actual timing can differ slightly from the entered duration.\n\n"
-            "Output FS / plotted Nyquist: the prepared buffer's rate is used by all plots, the WAV header, and playback. The PSD and spectrogram extend to OUTPUT FS / 2. For example, synthesis FS = 44000 Hz and speaker output FS = 96000 Hz produce a 48 kHz plotted Nyquist limit, while the source Nyquist limit remains 22 kHz. The timing readout explicitly shows synthesis FS, output FS, and plotted Nyquist.\n\n"
+            "Synthesis FS (Hz): whole-number sample rate used to generate the actual output cycle. Frequencies must be below synthesis FS / 2. For a DAQ, output FS equals synthesis FS. For speakers, one full cycle is resampled to the selected audio device's native rate BEFORE cycle repetition, saving, and playback. The cycle length rounds up to a whole output sample, so actual timing can differ slightly from the entered duration. The separate hypothetical preview uses the entered Hypothetical FS.\n\n"
+            "Output FS / plotted Nyquist: the actual prepared output rate is used by the WAV and playback. With hypothetical preview unchecked, all plots use that same rate and show frequencies to output FS / 2. With it checked, the plots use the entered Hypothetical FS and extend to half that rate; the WAV and playback rates do not change.\n\n"
             "Resampling filter: an explicit low-pass FIR with 80 × max(up, down) + 1 taps and a Kaiser window (beta = 10) suppresses interpolation images and filters before downsampling. Its cutoff is half the lower of synthesis FS and output FS; components near that cutoff can be attenuated. This does not undo aliasing already present in the synthesized cycle or eliminate genuine finite-burst and phase-coding sidebands. The full prepared spectrum remains visible for debugging.\n\n"
             "Amplitude: peak volts for DAQ output (0–10), or digital full-scale amplitude for speakers (0–1). Speaker volume also depends on macOS volume; this is not calibrated acoustic pressure. No automatic normalization is applied.\n\n"
             "Repeats: positive integer number of identical probe-plus-silence cycles. Every cycle restarts the waveform and internal M-sequence phase.\n\n"
             "Total playback duration: prepared cycle samples × repeats / output rate. The displayed duration uses actual sample counts and remains available when a sequence exceeds the preview limit. Entire sequences are prepared in memory.\n\n"
-            "Save generated signal to WAV: writes the same prepared float32 buffer used by the previews and playback, including all repeats, duty-cycle silence, and speaker resampling. The WAV header uses the PREPARED OUTPUT rate, which can differ from synthesis FS for speakers. Playback reads this buffer directly; it does not reload the WAV. Choose its path with Browse.\n\n"
-            "Start / Stop: Start captures one prepared buffer and its output device. Plots stay tied to that buffer while it is playing, even if signal parameters are edited; the new settings are prepared and shown after playback stops. The lag zoom control still works while playing. Stop interrupts playback. The WAV, when enabled, contains the FULL prepared sequence even if playback is stopped early. Speaker playback explicitly uses the captured audio-device index.\n\n"
-            "Previews, left to right: waveform (amplitude versus time, including repeats and silence); time-averaged PSD; spectrogram (frequency versus time); autocorrelation. All four plots use samples from the single prepared output buffer after float32 conversion and speaker resampling. The PSD averages the spectrogram's linear power densities, including silence, before conversion to dB. Segment detrending is disabled: subtracting an unweighted segment mean before Hann windowing can create a spurious near-DC feature. Finite probe duration, gating, and phase coding still produce real spectral spread outside nominal frequencies. These plots describe the intended electrical/digital waveform, not the transducer or speaker response. Preview limit: 2,000,000 prepared output samples. Larger sequences can still be saved/played but display a preview-limit message. Entire sequences are prepared in memory.\n\n"
-            "Autocorrelation: Tone and Chirp show the ENVELOPE of the complete prepared output buffer's aperiodic autocorrelation, including repeats and silence, normalized to its zero-lag value. M sequences show the circular (periodic) autocorrelation ENVELOPE of ONE full prepared cycle, which is what a looped transmission produces; any duty-cycle silence is included, and at 100% duty a dashed line marks the ideal 1/N sidelobe floor. The plot title and vertical-axis label identify the mode. Both use a −100 dB display floor and the same zero-lag zoom. Silent signals are labeled rather than normalized.\n\n"
+            "Save WAV + TXT + PNG: prepares the signal from the current controls and writes the complete float32 REAL output buffer without playing it. A same-name .txt file records the selected settings, plot mode, plot window, lag width, and actual output timing. A same-name .png directly exports waveform, PSD, and spectrogram plots for the selected time window and preview mode. The WAV always contains the full real output signal. Choose the WAV path with Browse. Save is unavailable during playback.\n\n"
+            "Start / Stop: Start captures one prepared buffer and its output device and plays it without saving files. Plots stay tied to that buffer while it is playing, even if signal parameters are edited; the new settings are prepared and shown after playback stops. The lag zoom control still works while playing. Stop interrupts playback. Speaker playback explicitly uses the captured audio-device index.\n\n"
+            "Previews, left to right: waveform (amplitude versus time, including repeats and silence); time-averaged PSD; spectrogram (frequency versus time); autocorrelation. All four use the selected preview mode. The first three use the selected time window; autocorrelation retains its full-signal or one-cycle definition. The PSD averages the selected window's spectrogram power densities, including silence, before conversion to dB. Segment detrending is disabled: subtracting an unweighted segment mean before Hann windowing can create a spurious near-DC feature. Finite probe duration, gating, and phase coding still produce real spectral spread outside nominal frequencies. These plots describe electrical/digital waveforms, not the transducer or speaker response. Preview limit: 2,000,000 samples in the selected mode, so the available hypothetical duration depends on the entered Hypothetical FS.\n\n"
+            "Hypothetical preview and Hypothetical FS (Hz): unchecked plots the exact float32 output samples that the WAV contains and Start sends to the selected device; the rate field is disabled. Checked enables the rate field and synthesizes a separate float32 waveform at that positive whole-number sample rate from the captured Tone, Chirp, or M-sequence parameters. The default is 2,000,000 Hz. The hypothetical waveform is for inspection only and is never sent to the device or saved as the WAV. M-sequence chip counts stay the same, but integer chip lengths and effective chip rate can differ at the entered rate. The TXT identifies the plot mode and rate and records hypothetical chip timing when relevant. The hypothetical preview does not model a speaker's acoustic response. Saving a hypothetical PNG requires its full sequence to fit the 2,000,000-sample preview limit.\n\n"
+            "Plot time window: Duration and Start sliders to the left of the figure select which samples appear in the waveform, PSD, spectrogram, and saved PNG. Duration ranges from 1 ms to the selected preview's full duration; for shorter signals it is fixed at the full duration. Start ranges from zero to the latest start that keeps the selected window inside that preview. The TXT records the exact selected sample indices and times at the plot rate. The WAV always holds the complete real output buffer.\n\n"
+            "Autocorrelation: Tone and Chirp show the ENVELOPE of the selected preview mode's complete signal aperiodic autocorrelation, including repeats and silence, normalized to its zero-lag value. M sequences show the circular (periodic) autocorrelation ENVELOPE of ONE full cycle in the selected mode; any duty-cycle silence is included, and at 100% duty a dashed line marks the ideal 1/N sidelobe floor. The plot title and vertical-axis label identify the mode. Both use a −100 dB display floor and the same zero-lag zoom. Silent signals are labeled rather than normalized.\n\n"
             "Lag half-width (ms): positive width on EACH side of zero lag in the autocorrelation plot. The default 5 gives a fixed view from −5 to +5 ms. Change it to inspect a narrower central peak or wider sidelobe region. The same range is retained when changing signal type or repeats; this is a display setting and does not change playback or WAV samples. Lags are displayed in milliseconds.\n\n"
             "Edge taper: Tone and Chirp use a Tukey window with alpha = 0.1 to smooth the first and last 5% of their active interval. M sequences have NO burst taper: the first and last chips retain the same source amplitude as all other chips. Speaker resampling still filters transitions and may introduce ringing; it is separate from amplitude tapering."
         )
         descriptions = dict()
         descriptions["Tone"] = "TONE\n\nFundamental frequency (Hz): frequency of a sinusoidal probe.\n\nThe tone occupies the first duty-cycle fraction of T_cycle. For T_cycle = 0.100 s and duty-cycle = 50%, a 0.050 s tapered tone is followed by 0.050 s silence.\n\n"
         descriptions["Chirp"] = "CHIRP\n\nStart frequency (Hz): frequency at the beginning of the cycle.\n\nStop frequency (Hz): frequency that the sweep reaches at the end of the ACTIVE pulse. Both upward and downward sweeps are supported.\n\nThe full start-to-stop sweep always fits inside the active interval, so the transmitted bandwidth does not depend on duty-cycle. The instantaneous frequency is start + (stop − start) × t / active duration.\n\nFor start = 5000 Hz, stop = 4000 Hz, T_cycle = 0.100 s, and duty-cycle = 50%, the sweep runs from 5000 Hz to 4000 Hz in 0.050 s, then the remaining 0.050 s is silent.\n\n"
-        descriptions["M sequences"] = "M SEQUENCES\n\nCarrier frequency (Hz): sinusoid whose sign switches according to a repeatable maximum-length binary sequence. Signs +1 and −1 correspond to carrier phase 0° and 180° (binary phase-shift keying). No whole-burst taper is applied.\n\nSequence order: integer from 2 to 16. The sequence contains N = 2^order − 1 chips. SciPy's default taps and all-ones initial state produce the same code on every cycle.\n\nM-sequence timing: cycle samples = round(FS × T_cycle), active budget = round(cycle samples × duty-cycle / 100), and samples per chip = floor(active budget / N), rounded down to a length that holds a WHOLE NUMBER OF CARRIER CYCLES. Every chip has exactly that many synthesis samples, with at least two samples per chip required for a nonzero duty. Whole carrier cycles per chip keep the carrier continuous across chips and across repeated periods, which the ideal periodic autocorrelation requires. Actual active samples = N × samples per chip. At 100% duty the cycle equals the active samples (a continuous loop); otherwise the remaining cycle samples are silent. Python's nearest-sample round uses ties to even.\n\nFor carrier 10000 Hz, order 7, synthesis FS = 44000 Hz, T_cycle = 0.0635 s, and duty-cycle = 100%, a chip must be a multiple of 22 samples (5 carrier cycles). The 2794-sample budget fits 127 chips × 22 samples exactly, giving 2000 chips/s, a main lobe from 8 to 12 kHz, and a 63.5 ms period that loops with no gap. The readout displays actual timing alongside the requested duration and duty.\n\nMain-lobe checks: carrier − actual chip rate must be above 0 Hz, and carrier + actual chip rate must be below min(synthesis FS, output FS) / 2. These checks place the nominal main lobe between DC and both Nyquist limits; rectangular chip transitions still have spectral sidelobes outside that lobe, so these checks do not guarantee zero aliasing.\n\nSource and output timing: chip lengths are equal integers at synthesis FS. Speaker resampling may place chip transitions between native output samples and filters the rectangular transitions; it does not guarantee equal integer output-sample counts per chip. All four previews, the WAV, and playback still use the same final prepared samples.\n\nCircular envelope: one full prepared cycle is used. Compute R = real(ifft(fft(x) × conj(fft(x)))), then the Hilbert envelope abs(hilbert(R)). Normalize the envelope by its zero-lag value, center the lag axis, and plot 20 × log10(normalized envelope). Additional repeats do not participate; duty-cycle silence does. For the textbook result (a single peak one chip wide on a flat floor 1/N below it) use 100% duty and at least two repeats, and process any received period after the first.\n\nThis is a carrier-modulated waveform diagnostic. Speaker resampling and filtering can change its shape from the textbook MLS result; DAQ output is not resampled. No M-sequence burst taper is applied. At 0% duty the output is silent and chip rate is shown as zero. Use the actual saved waveform as the matched-filter template. Physical source/receiver bandwidth further shapes the received signal.\n\n"
+        descriptions["M sequences"] = "M SEQUENCES\n\nCarrier frequency (Hz): sinusoid whose sign switches according to a repeatable maximum-length binary sequence. Signs +1 and −1 correspond to carrier phase 0° and 180° (binary phase-shift keying). No whole-burst taper is applied.\n\nSequence order: integer from 2 to 16. The sequence contains N = 2^order − 1 chips. SciPy's default taps and all-ones initial state produce the same code on every cycle.\n\nM-sequence timing: cycle samples = round(FS × T_cycle), active budget = round(cycle samples × duty-cycle / 100), and samples per chip = floor(active budget / N), rounded down to a length that holds a WHOLE NUMBER OF CARRIER CYCLES. Every chip has exactly that many synthesis samples, with at least two samples per chip required for a nonzero duty. Whole carrier cycles per chip keep the carrier continuous across chips and across repeated periods, which the ideal periodic autocorrelation requires. Actual active samples = N × samples per chip. At 100% duty the cycle equals the active samples (a continuous loop); otherwise the remaining cycle samples are silent. Python's nearest-sample round uses ties to even.\n\nFor carrier 10000 Hz, order 7, synthesis FS = 44000 Hz, T_cycle = 0.0635 s, and duty-cycle = 100%, a chip must be a multiple of 22 samples (5 carrier cycles). The 2794-sample budget fits 127 chips × 22 samples exactly, giving 2000 chips/s, a main lobe from 8 to 12 kHz, and a 63.5 ms period that loops with no gap. The readout displays actual timing alongside the requested duration and duty.\n\nMain-lobe checks: carrier − actual chip rate must be above 0 Hz, and carrier + actual chip rate must be below min(synthesis FS, output FS) / 2. These checks place the nominal main lobe between DC and both Nyquist limits; rectangular chip transitions still have spectral sidelobes outside that lobe, so these checks do not guarantee zero aliasing.\n\nSource and output timing: chip lengths are equal integers at synthesis FS. Speaker resampling may place chip transitions between native output samples and filters the rectangular transitions; it does not guarantee equal integer output-sample counts per chip. Exact previews, the WAV, and playback use the same final prepared samples. The hypothetical mode computes separate chip timing at the entered Hypothetical FS.\n\nCircular envelope: one full cycle of the selected preview mode is used. Compute R = real(ifft(fft(x) × conj(fft(x)))), then the Hilbert envelope abs(hilbert(R)). Normalize the envelope by its zero-lag value, center the lag axis, and plot 20 × log10(normalized envelope). Additional repeats do not participate; duty-cycle silence does. For the textbook result (a single peak one chip wide on a flat floor 1/N below it) use 100% duty and at least two repeats, and process any received period after the first.\n\nThis is a carrier-modulated waveform diagnostic. Speaker resampling and filtering can change its shape from the textbook MLS result; DAQ output is not resampled. No M-sequence burst taper is applied. At 0% duty the output is silent and chip rate is shown as zero. Use the actual saved waveform as the matched-filter template. Physical source/receiver bandwidth further shapes the received signal.\n\n"
         for signal_type in ("Tone", "Chirp", "M sequences"):
             tab = ttk.Frame(notebook)
             notebook.add(tab, text=signal_type)
@@ -256,7 +325,7 @@ class ChirpTransmitApp:
             text.bold_font = tkfont.nametofont("TkDefaultFont").copy()
             text.bold_font.configure(weight="bold")
             text.tag_configure("parameter", font=text.bold_font)
-            for match in re.finditer(r"^(?:Fundamental frequency \(Hz\)|Start frequency \(Hz\)|Stop frequency \(Hz\)|Carrier frequency \(Hz\)|Sequence order|M-sequence timing|Circular envelope|Main-lobe checks|Source and output timing|Device|AO channel|Signal type|T_cycle \(s\)|Duty-cycle %|Synthesis FS \(Hz\)|Output FS / plotted Nyquist|Resampling filter|Amplitude|Repeats|Total playback duration|Save generated signal to WAV|Start / Stop|Previews, left to right|Autocorrelation|Lag half-width \(ms\)|Edge taper):", text.get("1.0", "end-1c"), re.MULTILINE):
+            for match in re.finditer(r"^(?:Fundamental frequency \(Hz\)|Start frequency \(Hz\)|Stop frequency \(Hz\)|Carrier frequency \(Hz\)|Sequence order|M-sequence timing|Circular envelope|Main-lobe checks|Source and output timing|Device|AO channel|Signal type|T_cycle \(s\)|Duty-cycle %|Synthesis FS \(Hz\)|Output FS / plotted Nyquist|Resampling filter|Amplitude|Repeats|Total playback duration|Save WAV \+ TXT \+ PNG|Start / Stop|Previews, left to right|Hypothetical preview and Hypothetical FS \(Hz\)|Plot time window|Autocorrelation|Lag half-width \(ms\)|Edge taper):", text.get("1.0", "end-1c"), re.MULTILINE):
                 text.tag_add("parameter", f"1.0+{match.start()}c", f"1.0+{match.end() - 1}c")
             text.config(state="disabled")
             if signal_type == self.signal_type_var.get():
@@ -294,39 +363,41 @@ class ChirpTransmitApp:
             lag_half_width_ms = float(self.lag_half_width_var.get())
             if not np.isfinite(lag_half_width_ms) or lag_half_width_ms <= 0:
                 raise ValueError("Lag half-width must be a finite, positive number of milliseconds.")
-            prepared = self.active_output if self.running else self._prepare_output()
-            self.output_info_var.set(prepared['description'])
+            real_prepared = self.active_output if self.running else self._prepare_output()
+            self.output_info_var.set(real_prepared['description'])
+            prepared = self._plot_prepared_output(real_prepared)
             self.sequence_info_var.set(prepared['sequence_info'])
             if prepared['total_samples'] > 2_000_000:
                 raise ValueError("Preview limited to 2,000,000 prepared output samples; reduce duration or repeats.")
         except Exception as exc:
             self.preview_frame.config(text="Output preview unavailable")
-            if not self.output_info_var.get():
-                self.output_info_var.set(str(exc))
+            self.output_info_var.set(str(exc))
             self.preview_axes.text(0.5, 0.5, str(exc), ha="center", va="center", wrap=True, transform=self.preview_axes.transAxes)
             self.preview_canvas.draw_idle()
             return
 
         data = prepared['data']
-        cycle = prepared['cycle']
         fs = prepared['fs']
+        start_sample, end_sample = self._plot_window_samples(prepared)
+        window_data = data[start_sample:end_sample]
         speaker = prepared['device'] == SPEAKER_DEVICE
         psd_label = "PSD (dB re 1 full-scale²/Hz)" if speaker else "PSD (dB re 1 V²/Hz)"
         self.waveform_axes.set_ylabel("Amplitude (full scale)" if speaker else "Voltage (V)")
         self.psd_axes.set_ylabel(psd_label)
-        label = "Playing output" if self.running else "Prepared output"
-        self.preview_frame.config(text=f"{label} — {prepared['output_name']} — Output FS: {fs} Hz; plotted Nyquist: {fs / 2000:g} kHz — waveform, PSD, spectrogram, autocorrelation")
-        sample_times = np.arange(len(data)) / fs
-        self.waveform_axes.plot(sample_times, data, linewidth=0.7)
-        self.waveform_axes.set_xlim(0, len(data) / fs)
-        nperseg = min(512, len(cycle))
+        label = "Hypothetical preview — not sent or saved as WAV" if self.hypothetical_preview_var.get() else ("Playing output" if self.running else "Prepared output")
+        self.preview_frame.config(text=f"{label} — {prepared['output_name']} — Plot FS: {fs} Hz; real output FS: {real_prepared['fs']} Hz — waveform, PSD, spectrogram, autocorrelation")
+        sample_times = np.arange(start_sample, end_sample) / fs
+        self.waveform_axes.plot(sample_times, window_data, linewidth=0.7)
+        self.waveform_axes.set_xlim(start_sample / fs, end_sample / fs)
+        nperseg = self._spectrogram_nperseg(prepared, len(window_data))
         # Preserve the original segments: mean subtraction before Hann windowing can introduce near-DC power.
-        frequencies, times, psd = spectrogram(data, fs=fs, window="hann", nperseg=nperseg, noverlap=int(0.75 * nperseg), scaling="density", mode="psd", detrend=False)
+        frequencies, times, psd = spectrogram(window_data, fs=fs, window="hann", nperseg=nperseg, noverlap=int(0.75 * nperseg), scaling="density", mode="psd", detrend=False)
+        times = times + start_sample / fs
         psd = np.asarray(psd, dtype=np.float64)
         psd_db = 10 * np.log10(np.maximum(psd, np.finfo(float).tiny))
         peak_db = max(float(np.max(psd_db)), -160.0)
         image = self.preview_axes.pcolormesh(times, frequencies / 1000, psd_db, shading="auto", cmap="viridis", vmin=peak_db - 80, vmax=peak_db)
-        self.preview_axes.set_xlim(0, len(data) / fs)
+        self.preview_axes.set_xlim(start_sample / fs, end_sample / fs)
         self.preview_axes.set_ylim(0, fs / 2000)
         self.preview_colorbar = self.preview_figure.colorbar(image, ax=self.preview_axes)
         self.preview_colorbar.set_label(psd_label)
@@ -558,6 +629,7 @@ class ChirpTransmitApp:
         sequence_description = f"{repeats} cycle(s)"
         prepared = dict()
         prepared['key'] = key
+        prepared['parameters'] = parameters
         prepared['device'] = device
         prepared['channel'] = channel
         prepared['audio_device'] = audio_device
@@ -567,7 +639,7 @@ class ChirpTransmitApp:
         prepared['fs'] = output_fs
         prepared['cycle_samples'] = cycle_samples
         prepared['total_samples'] = total_samples
-        prepared['description'] = f"Synthesis FS: {source_fs} Hz | Output FS (plots/WAV/playback): {output_fs} Hz | Plotted Nyquist: {output_fs / 2000:g} kHz | {sequence_description} | Total playback duration: {total_samples / output_fs:.6g} s"
+        prepared['description'] = f"Synthesis FS: {source_fs} Hz | Real output FS (WAV/playback): {output_fs} Hz | Real output Nyquist: {output_fs / 2000:g} kHz | {sequence_description} | Total playback duration: {total_samples / output_fs:.6g} s"
         prepared['sequence_info'] = ""
         prepared['m_sequence_timing'] = m_sequence_timing
         if signal_type == "M sequences":
@@ -598,6 +670,65 @@ class ChirpTransmitApp:
         self.prepared_output = prepared
         return prepared
 
+    def _plot_prepared_output(self, prepared):
+        if not self.hypothetical_preview_var.get():
+            return prepared
+        hypothetical_fs_value = float(self.hypothetical_fs_var.get())
+        if not np.isfinite(hypothetical_fs_value) or hypothetical_fs_value <= 0 or not hypothetical_fs_value.is_integer():
+            raise ValueError("Hypothetical FS must be a positive whole number of samples per second.")
+        hypothetical_fs = int(hypothetical_fs_value)
+        if self.hypothetical_output is not None and self.hypothetical_output['real_key'] == prepared['key'] and self.hypothetical_output['fs'] == hypothetical_fs:
+            return self.hypothetical_output
+        signal_type, f0, f1, t_cycle, duty_cycle, source_fs, amplitude, repeats, order = prepared['parameters']
+        if max(f0, f1) >= hypothetical_fs / 2:
+            raise ValueError(f"Hypothetical preview frequencies must be below {hypothetical_fs / 2:g} Hz (half of Hypothetical FS).")
+        if signal_type == "M sequences":
+            cycle_samples, active_budget, samples_per_chip, active_samples = self._m_sequence_timing(f0, t_cycle, duty_cycle, hypothetical_fs, order)
+            if duty_cycle > 0 and samples_per_chip < 2:
+                raise ValueError(f"The selected M-sequence settings cannot fit equal chips at Hypothetical FS = {hypothetical_fs} Hz.")
+            chip_rate = hypothetical_fs / samples_per_chip if active_samples else 0
+            if active_samples:
+                self._check_m_sequence_band(f0, chip_rate, hypothetical_fs, hypothetical_fs)
+        else:
+            cycle_samples = int(round(t_cycle * hypothetical_fs))
+        if cycle_samples < 2:
+            raise ValueError("T_cycle must contain at least two hypothetical samples; increase Hypothetical FS or T_cycle.")
+        if signal_type in ("Tone", "Chirp") and duty_cycle > 0 and int(round(cycle_samples * duty_cycle / 100)) < 2:
+            raise ValueError("The active pulse must contain at least two hypothetical samples; increase Hypothetical FS or duty-cycle.")
+        total_samples = cycle_samples * repeats
+        if total_samples > 2_000_000:
+            raise ValueError(f"The hypothetical preview at {hypothetical_fs} Hz exceeds 2,000,000 samples. Reduce T_cycle, Repeats, or Hypothetical FS, or switch to exact output preview.")
+        cycle = np.asarray(self._make_signal(signal_type, f0, f1, t_cycle, duty_cycle, hypothetical_fs, amplitude, order), dtype=np.float32)
+        data = np.ascontiguousarray(self._make_output(cycle, repeats), dtype=np.float32)
+        data.setflags(write=False)
+        hypothetical = dict(prepared)
+        hypothetical['real_key'] = prepared['key']
+        hypothetical['fs'] = hypothetical_fs
+        hypothetical['source_fs'] = hypothetical_fs
+        hypothetical['source_cycle_samples'] = cycle_samples
+        hypothetical['cycle_samples'] = cycle_samples
+        hypothetical['total_samples'] = total_samples
+        hypothetical['cycle'] = data[:cycle_samples]
+        hypothetical['data'] = data
+        hypothetical['output_name'] = f"Hypothetical {hypothetical_fs} Hz synthesis — not sent"
+        hypothetical['reference_fs'] = prepared['fs']
+        if signal_type == "M sequences":
+            hypothetical['m_sequence_timing'] = dict(prepared['m_sequence_timing'])
+            hypothetical['m_sequence_timing']['chips'] = 2**order - 1
+            hypothetical['m_sequence_timing']['samples_per_chip'] = samples_per_chip
+            hypothetical['m_sequence_timing']['active_samples'] = active_samples
+            hypothetical['m_sequence_timing']['active_budget_samples'] = active_budget
+            hypothetical['m_sequence_timing']['active_duration'] = active_samples / hypothetical_fs
+            hypothetical['m_sequence_timing']['effective_duty'] = 100 * active_samples / cycle_samples
+            hypothetical['m_sequence_timing']['chip_rate'] = chip_rate
+            hypothetical['m_sequence_timing']['carrier_cycles_per_chip'] = f0 * samples_per_chip / hypothetical_fs
+            hypothetical['m_sequence_timing']['output_active_samples'] = active_samples
+            hypothetical['m_sequence_timing']['output_active_duration'] = active_samples / hypothetical_fs
+            hypothetical['m_sequence_period'] = data[:active_samples]
+            hypothetical['sequence_info'] = f"Hypothetical MLS: {2**order - 1} chips × {samples_per_chip} samples/chip | {f0 * samples_per_chip / hypothetical_fs:.6g} carrier cycles/chip | Chip rate: {chip_rate:.6g} chips/s | Active: {1000 * active_samples / hypothetical_fs:.6g} ms | Duty: {100 * active_samples / cycle_samples:.6g}% | Cycle: {1000 * cycle_samples / hypothetical_fs:.6g} ms"
+        self.hypothetical_output = hypothetical
+        return hypothetical
+
     def _play_speaker(self, prepared, stop_event):
         import sounddevice as sd
 
@@ -623,15 +754,149 @@ class ChirpTransmitApp:
         if error:
             messagebox.showerror("Transmit Error", error)
 
-    def _transmit_loop(self, prepared, wav_path, stop_event):
+    def _wav_parameter_text(self, prepared, plot_prepared, wav_path, lag_half_width_ms, start_sample, end_sample, hypothetical_fs_setting):
+        signal_type, f0, f1, t_cycle, duty_cycle, requested_fs, amplitude, repeats, order = prepared['parameters']
+        source_fs = prepared['source_fs']
+        source_cycle_samples = prepared['source_cycle_samples']
+        output_fs = prepared['fs']
+        cycle_samples = prepared['cycle_samples']
+        total_samples = prepared['total_samples']
+        m_sequence_timing = prepared['m_sequence_timing']
+        if m_sequence_timing is None:
+            active_samples = int(round(source_cycle_samples * duty_cycle / 100))
+        else:
+            active_samples = m_sequence_timing['active_samples']
+        lines = ["Acoustic signal WAV parameters", f"Created: {datetime.now().astimezone().isoformat(timespec='seconds')}", f"WAV file: {wav_path}", f"Plot PNG file: {Path(wav_path).with_suffix('.png')}", "WAV encoding: mono float32", "", "Requested signal settings", f"Signal type: {signal_type}"]
+        if signal_type == "Tone":
+            lines.append(f"Fundamental frequency (Hz): {f0}")
+        elif signal_type == "Chirp":
+            lines.append(f"Start frequency (Hz): {f0}")
+            lines.append(f"Stop frequency (Hz): {f1}")
+            lines.append("Chirp sweep: linear from start to stop across the active pulse")
+        else:
+            lines.append(f"Carrier frequency (Hz): {f0}")
+            lines.append(f"Sequence order: {order}")
+            lines.append("M-sequence code: SciPy max_len_seq default taps and initial state")
+        lines.extend([f"T_cycle requested (s): {t_cycle}", f"Duty-cycle requested (%): {duty_cycle}", f"Synthesis FS (Hz): {source_fs}", f"Amplitude ({'digital full scale' if prepared['device'] == SPEAKER_DEVICE else 'V peak'}): {amplitude}", f"Repeats: {repeats}", "", "Prepared WAV and output buffer", f"Output device: {prepared['device']}", f"Output device name: {prepared['output_name']}", f"AO channel: {prepared['channel'] if prepared['device'] != SPEAKER_DEVICE else 'not used'}", f"Output FS / WAV sample rate (Hz): {output_fs}", f"Source cycle samples: {source_cycle_samples}", f"Source active samples per cycle: {active_samples}", f"Source active duration per cycle (s): {active_samples / source_fs}", f"Source cycle duration (s): {source_cycle_samples / source_fs}", f"Effective source duty-cycle (%): {100 * active_samples / source_cycle_samples}", f"Output cycle samples: {cycle_samples}", f"Output cycle duration (s): {cycle_samples / output_fs}", f"Total WAV samples: {total_samples}", f"Total WAV duration (s): {total_samples / output_fs}"])
+        if prepared['device'] == SPEAKER_DEVICE:
+            lines.append(f"Speaker output device index: {prepared['audio_device']}")
+        if m_sequence_timing is None:
+            lines.append("Active-pulse taper: Tukey window, alpha = 0.1, when active pulse exceeds 2 samples")
+        else:
+            lines.extend([f"M-sequence chips per cycle: {m_sequence_timing['chips']}", f"Requested active budget (source samples): {m_sequence_timing['active_budget_samples']}", f"Synthesis samples per chip: {m_sequence_timing['samples_per_chip']}", f"Chip rate (chips/s): {m_sequence_timing['chip_rate']}", f"Carrier cycles per chip: {m_sequence_timing['carrier_cycles_per_chip']}", f"Output active samples per cycle: {m_sequence_timing['output_active_samples']}", f"Output active duration per cycle (s): {m_sequence_timing['output_active_duration']}", "Active-pulse taper: none"])
+        if source_fs == output_fs:
+            lines.append("Speaker resampling: none")
+        else:
+            lines.append(f"Speaker resampling ratio (output/synthesis): {Fraction(output_fs, source_fs)}")
+            lines.append("Speaker resampling: scipy.signal.resample_poly with FIR low-pass, 80 * max(up, down) + 1 taps, Kaiser beta = 10")
+        lines.append(f"Autocorrelation lag half-width (ms): {lag_half_width_ms}")
+        lines.append("Saved plot panels: waveform, time-averaged PSD, spectrogram")
+        lines.append(f"Plot mode: {'hypothetical synthesis (not sent)' if plot_prepared is not prepared else 'exact prepared output'}")
+        lines.append(f"Hypothetical FS setting (Hz): {hypothetical_fs_setting}")
+        lines.append(f"Plot sample rate (Hz): {plot_prepared['fs']}")
+        lines.append(f"Plot window start sample: {start_sample}")
+        lines.append(f"Plot window end sample (exclusive): {end_sample}")
+        lines.append(f"Plot window start (s): {start_sample / plot_prepared['fs']}")
+        lines.append(f"Plot window end (s): {end_sample / plot_prepared['fs']}")
+        lines.append(f"Plot window duration (s): {(end_sample - start_sample) / plot_prepared['fs']}")
+        if plot_prepared is not prepared and signal_type == "M sequences":
+            lines.append(f"Hypothetical samples per chip: {plot_prepared['m_sequence_timing']['samples_per_chip']}")
+            lines.append(f"Hypothetical chip rate (chips/s): {plot_prepared['m_sequence_timing']['chip_rate']}")
+            lines.append(f"Hypothetical carrier cycles per chip: {plot_prepared['m_sequence_timing']['carrier_cycles_per_chip']}")
+            lines.append(f"Hypothetical active duration (s): {plot_prepared['m_sequence_timing']['active_duration']}")
+            lines.append(f"Hypothetical effective duty-cycle (%): {plot_prepared['m_sequence_timing']['effective_duty']}")
+            lines.append(f"Hypothetical cycle duration (s): {plot_prepared['cycle_samples'] / plot_prepared['fs']}")
+        lines.append("The WAV contains the complete prepared buffer. Saving does not start playback.")
+        return "\n".join(lines) + "\n"
+
+    def _spectrogram_nperseg(self, prepared, window_samples):
+        reference_fs = prepared.get('reference_fs', prepared['fs'])
+        segment_samples = max(2, int(round(512 * prepared['fs'] / reference_fs)))
+        return min(segment_samples, len(prepared['cycle']), window_samples)
+
+    def _make_plot_png(self, prepared, start_sample, end_sample):
+        data = prepared['data']
+        fs = prepared['fs']
+        window_data = data[start_sample:end_sample]
+        speaker = prepared['device'] == SPEAKER_DEVICE
+        psd_label = "PSD (dB re 1 full-scale²/Hz)" if speaker else "PSD (dB re 1 V²/Hz)"
+        figure = Figure(figsize=(13, 4), dpi=150, constrained_layout=True)
+        FigureCanvasAgg(figure)
+        waveform_axes = figure.add_subplot(131)
+        psd_axes = figure.add_subplot(132)
+        spectrogram_axes = figure.add_subplot(133)
+        waveform_axes.plot(np.arange(start_sample, end_sample) / fs, window_data, linewidth=0.7)
+        waveform_axes.set_title("Time-signal waveform")
+        waveform_axes.set_xlabel("Time (s)")
+        waveform_axes.set_ylabel("Amplitude (full scale)" if speaker else "Voltage (V)")
+        waveform_axes.set_xlim(start_sample / fs, end_sample / fs)
+        waveform_axes.grid(alpha=0.25)
+        nperseg = self._spectrogram_nperseg(prepared, len(window_data))
+        frequencies, times, psd = spectrogram(window_data, fs=fs, window="hann", nperseg=nperseg, noverlap=int(0.75 * nperseg), scaling="density", mode="psd", detrend=False)
+        times = times + start_sample / fs
+        psd = np.asarray(psd, dtype=np.float64)
+        psd_db = 10 * np.log10(np.maximum(psd, np.finfo(float).tiny))
+        peak_db = max(float(np.max(psd_db)), -160.0)
+        image = spectrogram_axes.pcolormesh(times, frequencies / 1000, psd_db, shading="auto", cmap="viridis", vmin=peak_db - 80, vmax=peak_db)
+        spectrogram_axes.set_title("Spectrogram")
+        spectrogram_axes.set_xlabel("Time (s)")
+        spectrogram_axes.set_ylabel("Frequency (kHz)")
+        spectrogram_axes.set_xlim(start_sample / fs, end_sample / fs)
+        spectrogram_axes.set_ylim(0, fs / 2000)
+        figure.colorbar(image, ax=spectrogram_axes, label=psd_label)
+        mean_psd = np.mean(psd, axis=1)
+        mean_psd_db = 10 * np.log10(np.maximum(mean_psd, np.finfo(float).tiny))
+        psd_axes.plot(frequencies / 1000, mean_psd_db)
+        psd_axes.set_title("Time-averaged PSD")
+        psd_axes.set_xlabel("Frequency (kHz)")
+        psd_axes.set_ylabel(psd_label)
+        psd_axes.set_xlim(0, fs / 2000)
+        mean_peak_db = max(float(np.max(mean_psd_db)), -160.0)
+        psd_axes.set_ylim(mean_peak_db - 80, mean_peak_db + 5)
+        psd_axes.grid(alpha=0.25)
+        png = BytesIO()
+        figure.savefig(png, format="png")
+        return png.getvalue()
+
+    def _save_output_files(self, prepared, plot_prepared, wav_path, lag_half_width_ms, start_sample, end_sample, hypothetical_fs_setting):
+        from scipy.io import wavfile
+        plot_png = self._make_plot_png(plot_prepared, start_sample, end_sample)
+        parameter_text = self._wav_parameter_text(prepared, plot_prepared, wav_path, lag_half_width_ms, start_sample, end_sample, hypothetical_fs_setting)
+        wavfile.write(wav_path, prepared['fs'], prepared['data'])
+        Path(wav_path).with_suffix(".txt").write_text(parameter_text, encoding="utf-8")
+        Path(wav_path).with_suffix(".png").write_bytes(plot_png)
+
+    def save_output(self):
+        if self.running:
+            messagebox.showerror("Save error", "Stop playback before saving the current settings.")
+            return
+        try:
+            wav_path = self.wav_path_var.get().strip()
+            if not wav_path:
+                raise ValueError("Choose a WAV file path before saving.")
+            if not wav_path.lower().endswith(".wav"):
+                wav_path += ".wav"
+            prepared = self._prepare_output(for_playback=True)
+            plot_prepared = self._plot_prepared_output(prepared)
+            hypothetical_fs_setting = self.hypothetical_fs_var.get().strip()
+            lag_half_width_ms = float(self.lag_half_width_var.get())
+            if not np.isfinite(lag_half_width_ms) or lag_half_width_ms <= 0:
+                raise ValueError("Lag half-width must be a finite, positive number of milliseconds.")
+            start_sample, end_sample = self._plot_window_samples(plot_prepared)
+            self.status_var.set("Saving WAV, TXT, and PNG...")
+            self.root.update_idletasks()
+            self._save_output_files(prepared, plot_prepared, wav_path, lag_half_width_ms, start_sample, end_sample, hypothetical_fs_setting)
+        except Exception as exc:
+            self.status_var.set(f"Save error: {exc}")
+            messagebox.showerror("Save error", str(exc))
+            return
+        self.status_var.set(f"Saved {wav_path}, {Path(wav_path).with_suffix('.txt')}, and {Path(wav_path).with_suffix('.png')}")
+
+    def _transmit_loop(self, prepared, stop_event):
         error = None
         try:
             data = prepared['data']
             fs = prepared['fs']
-            if wav_path:
-                from scipy.io import wavfile
-                wavfile.write(wav_path, fs, data)
-
             if prepared['device'] == SPEAKER_DEVICE:
                 self._play_speaker(prepared, stop_event)
             else:
@@ -665,13 +930,6 @@ class ChirpTransmitApp:
             return
 
         try:
-            wav_path = None
-            if self.save_wav_var.get():
-                wav_path = self.wav_path_var.get().strip()
-                if not wav_path:
-                    raise ValueError("Choose a WAV file path or uncheck WAV saving.")
-                if not wav_path.lower().endswith(".wav"):
-                    wav_path += ".wav"
             prepared = self._prepare_output(for_playback=True)
             if prepared['device'] != SPEAKER_DEVICE and self.ao_channel_var.get() not in self.available_channels:
                 raise ValueError("Select an available AO channel.")
@@ -684,7 +942,7 @@ class ChirpTransmitApp:
         self.stop_event = threading.Event()
         self.status_var.set(f"Playing {prepared['output_name']} at {prepared['fs']} Hz. Previews show this buffer; parameter edits apply after playback stops.")
         self._update_preview()
-        self.thread = threading.Thread(target=self._transmit_loop, args=(prepared, wav_path, self.stop_event), daemon=True)
+        self.thread = threading.Thread(target=self._transmit_loop, args=(prepared, self.stop_event), daemon=True)
         self.thread.start()
 
     def stop_output(self):
