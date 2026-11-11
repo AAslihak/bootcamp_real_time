@@ -52,7 +52,7 @@ except Exception as exc:  # package or driver not installed
     nidaqmx = None
     NIDAQMX_ERROR = exc
 
-VERSION = "3.0-beta.1"  # shown in the window title; see GUI/CHANGELOG.md
+VERSION = "3.0-beta.2"  # shown in the window title; see GUI/CHANGELOG.md
 SIM_NAME = "Simulated (no hardware)"
 AO_VMAX = 10.0  # USB-6259 AO range is +/-10 V
 MAX_AO_SAMPLES = 100_000_000  # whole sequence is written at once (~800 MB cap)
@@ -81,6 +81,9 @@ DEFAULT_DISTANCE_M = 0.30  # hydrophone-to-source distance when the program star
 REF_DISTANCE_M = 1.0  # pressure levels are referred to this distance (1/r spreading)
 TVR_EQ_PAD_S = 0.01  # zeros added around the shot while it is inverse filtered
 PRESSURE_UNIT = "dB re 1 µPa²/Hz @ 1 m"
+# Window applied before every FFT of the hydrophone signal (PSD and spectrogram):
+# "none" = rectangular (no window), "hann" = Hann window.
+SPECTRUM_WINDOW = "none"
 TX_PSD_SEGMENT_S = 1.0  # segment length of the transmit PSD: 1 s gives 1 Hz resolution
 SPECTRUM_FMAX = 20e3  # spectra are displayed from 0 to this frequency (Hz)
 SPECTRUM_FMIN_LOG = 10.0  # lower edge of the log frequency axis (Hz)
@@ -532,8 +535,13 @@ def power_spectral_density(x, fs, nseg, nfft=None, hann=True):
                  detrend=False, scaling="density")
 
 
+def spectrum_window(n):
+    """Window of n points used for the hydrophone PSD and the spectrogram."""
+    return np.hanning(n) if SPECTRUM_WINDOW == "hann" else np.ones(n)
+
+
 def record_psd(x, fs, win, win_power):
-    """One-sided PSD (V^2/Hz) of one whole record: a single Hann-windowed periodogram.
+    """One-sided PSD (V^2/Hz) of one whole record: a single periodogram (window: SPECTRUM_WINDOW).
 
     psd = 2 |FFT(win * x)|^2 / (fs * sum(win^2)); the 0 Hz and Nyquist bins are
     not doubled. Frequency resolution is fs / len(x), i.e. 1 / record duration.
@@ -699,7 +707,7 @@ class MainWindow(QtWidgets.QMainWindow):
         W = QtWidgets
         central = FrameWidget()
         self.central = central
-        self._psd_win = None  # cached Hann window for the current record length
+        self._psd_win = None  # cached window for the current record length
         self._psd_next = 0.0  # earliest time for the next hydrophone PSD
         self.sl_now = None  # displayed SL: (peak of the hydrophone PSD in dB, its frequency in Hz)
         self.sl_best = None  # highest PSD peak seen so far in the current SL period
@@ -1449,7 +1457,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.ring_fill >= n_rec and now >= self._psd_next:
             # PSD of exactly the record shown in the time plot (one FFT of FFT-length points)
             if self._psd_win is None or self._psd_win[0].size != n_rec:
-                win = np.hanning(n_rec)
+                win = spectrum_window(n_rec)
                 self._psd_win = (win, float(np.sum(win ** 2)))
             f, spec = record_psd(self.ring[-n_rec:], fs, *self._psd_win)
             df, f, db = f[1], f[1:], psd_db(spec[1:])
@@ -1511,7 +1519,7 @@ class MainWindow(QtWidgets.QMainWindow):
         f = np.fft.rfftfreq(nfft, 1.0 / fs)
         ncol = max(2, int(np.searchsorted(f, SPECTRUM_FMAX, side="right")))
         nrow = max(2, int(round(self.sp_sgspan.value() * fs / hop)))
-        win = np.hanning(nfft)
+        win = spectrum_window(nfft)
         offset = np.zeros(ncol)  # dB subtracted from every row
         if cal is not None:
             fc = f[:ncol]
@@ -1522,7 +1530,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sg = {
             "hop": hop, "navg": navg, "nfft": nfft, "win": win, "ncol": ncol,
             "offset": offset,
-            # one-sided power spectral density of a Hann-windowed segment
+            # one-sided power spectral density of one segment (window: SPECTRUM_WINDOW)
             "scale": 2.0 / (fs * np.sum(win ** 2)),
             "pending": 0, "dirty": True,
             "img": np.full((nrow, ncol), SPECTROGRAM_FLOOR, dtype=np.float32),
@@ -1534,7 +1542,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.plot_sg.setYRange(-span, 0, padding=0)
 
     def _feed_spectrogram(self, n_new):
-        """Add one row per `hop` new samples; rows are Hann-windowed PSDs in dB."""
+        """Add one row per `hop` new samples; rows are PSDs in dB."""
         sg = self.sg
         if sg is None:
             return

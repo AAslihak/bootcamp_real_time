@@ -1,6 +1,14 @@
 # Changelog — DAQ GUI
 
-## v3.0-beta.1 — beta (tag `gui-v3.0-beta.1`, branch `gui-v3-beta`)
+## v3.0-beta.2 — beta (tag `gui-v3.0-beta.2`, branch `gui-v3-beta`)
+
+- No window function: the hydrophone PSD and the spectrogram now use a
+  rectangular window instead of Hann (the transmit PSD already had none).
+  Set `SPECTRUM_WINDOW = "hann"` at the top of the program to restore it.
+  Without a window the noise floor next to a strong signal is higher
+  (spectral leakage), and readings differ from v2 / beta.1.
+
+## v3.0-beta.1 — beta (tag `gui-v3.0-beta.1`)
 
 Files: `6259/daq_gui_v3.py`, `6366/daq_gui_6366_v3.py`. Only run with the
 simulated device so far. The v2 files are unchanged.
